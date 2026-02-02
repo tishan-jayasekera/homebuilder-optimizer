@@ -44,6 +44,8 @@ class OptimizationConfig:
     solver: str = "SCS"  # ECOS, MOSEK, or SCS
     max_solve_time: float = 60.0  # seconds
     verbose: bool = False
+    min_budget_utilization: float = 0.0  # Force spending at least X% of budget (0 = no floor)
+    fallback_transfer_rate: float = 0.1  # Used when no transition data exists
 
 
 @dataclass
@@ -129,6 +131,7 @@ class MathematicalOptimizer:
         self.targets = builder_targets
         self.transitions = transition_matrix
         self.lag_metrics = lag_metrics or {'L_conv': 14, 'L_ref': 21, 'L_media': 7}
+        self.fallback_transfer_rate = 0.1
         
         # Extract dimensions
         self.sources = self._extract_sources()
@@ -171,10 +174,14 @@ class MathematicalOptimizer:
     def _get_transfer_rate(self, source: str, target: str) -> float:
         """Get referral transfer rate from source to target."""
         if self.transitions.empty:
-            return 0.0
+            # No transition data; assume direct impact to avoid zero-referral solutions
+            return self.fallback_transfer_rate
         if source in self.transitions.index and target in self.transitions.columns:
-            return self.transitions.loc[source, target]
-        return 0.0
+            val = self.transitions.loc[source, target]
+            return val if val > 0 else self.fallback_transfer_rate
+        if source == target:
+            return 1.0
+        return self.fallback_transfer_rate
     
     def optimize(self, config: OptimizationConfig) -> OptimizationResult:
         """
@@ -201,6 +208,7 @@ class MathematicalOptimizer:
                 solver_message="CVXPY not installed. Run: pip install cvxpy"
             )
         
+        self.fallback_transfer_rate = config.fallback_transfer_rate
         n_sources = len(self.sources)
         n_builders = len(self.builders)
         n_periods = config.horizon_days
@@ -264,18 +272,10 @@ class MathematicalOptimizer:
         # ========================================
         # OBJECTIVE FUNCTION
         # ========================================
-        # Minimize total spend while maximizing referrals
-        # (Can't directly minimize ratio, so use alternative formulation)
-        
+        # Maximize total referrals (budget utilization handled by constraints)
         total_spend_expr = cp.sum(spend)
         total_refs_expr = cp.sum(referrals)
-        
-        # Alternative: Maximize referrals per dollar (inverse of CPR)
-        # Or: Minimize spend - lambda * referrals (trade-off)
-        
-        # Using weighted sum for now (adjust lambda for different trade-offs)
-        lambda_weight = 0.1  # How much we value referrals vs. cost savings
-        objective = cp.Minimize(total_spend_expr - lambda_weight * total_refs_expr)
+        objective = cp.Maximize(total_refs_expr)
         
         # ========================================
         # CONSTRAINTS
@@ -284,6 +284,7 @@ class MathematicalOptimizer:
         
         # 1. Total budget constraint
         constraints.append(total_spend_expr <= config.total_budget)
+        constraints.append(total_spend_expr >= config.min_budget_utilization * config.total_budget)
         
         # 2. Pacing constraints for each builder
         for j, builder in enumerate(self.builders):
@@ -311,11 +312,12 @@ class MathematicalOptimizer:
                 # )
         
         # 3. Source diversity constraint (no single source dominates)
-        for i in range(n_sources):
-            source_spend = cp.sum(spend[i, :, :])
-            constraints.append(
-                source_spend <= config.max_single_source_share * total_spend_expr
-            )
+        if n_sources * config.max_single_source_share >= 1.0:
+            for i in range(n_sources):
+                source_spend = cp.sum(spend[i, :, :])
+                constraints.append(
+                    source_spend <= config.max_single_source_share * total_spend_expr
+                )
         
         # 4. Timing constraints (no spend too late to have impact)
         for j, builder in enumerate(self.builders):
@@ -606,10 +608,17 @@ def quick_optimize(
     config = OptimizationConfig(
         total_budget=total_budget,
         horizon_days=horizon_days,
-        solver=solver
+        solver=solver,
+        min_budget_utilization=0.9
     )
-    
-    return optimizer.optimize(config)
+
+    result = optimizer.optimize(config)
+    if result.status in {SolverStatus.INFEASIBLE, SolverStatus.UNBOUNDED}:
+        # Retry without budget floor if constraints are too tight
+        config.min_budget_utilization = 0.0
+        result = optimizer.optimize(config)
+
+    return result
 
 
 if __name__ == "__main__":
