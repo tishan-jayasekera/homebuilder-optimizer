@@ -20,6 +20,8 @@ from src.data_loader import load_events, load_origin_perf, load_media_raw
 from src.normalization import normalize_events
 from src.optimization_engine import ReferralOptimizationEngine
 from src.network_optimization import build_prescriptive_plan, compute_lag_metrics_simple, analyze_network_leverage, calculate_shortfalls
+from src.attribution_engine import FullFunnelAttributor
+from src.mathematical_optimizer import MathematicalOptimizer, OptimizationConfig, quick_optimize
 
 
 st.set_page_config(
@@ -397,6 +399,135 @@ else:
 if not timing_df.empty:
     st.markdown("**Media Timing Alerts**")
     st.dataframe(timing_df, hide_index=True, use_container_width=True)
+
+st.markdown('</div>', unsafe_allow_html=True)
+
+# ============================================
+# NEW SECTION: Full Funnel Attribution Analysis
+# ============================================
+st.markdown('<div class="section-card">', unsafe_allow_html=True)
+st.markdown("**🔗 Full Funnel Attribution (Network Effects)**")
+
+# Initialize attributor
+attributor = FullFunnelAttributor(events)
+
+# Compute all attributions
+with st.spinner("Computing network-wide attribution..."):
+    attribution_df = attributor.compute_all_attributions()
+
+if not attribution_df.empty:
+    # Show top performers by system efficiency
+    st.markdown("**Top Payers by System-Level Efficiency**")
+    display_attr = attribution_df.sort_values('System_CPR', ascending=True).head(15).copy()
+    display_attr['System_CPR'] = display_attr['System_CPR'].apply(lambda x: f"${x:,.0f}" if x < float('inf') else "N/A")
+    display_attr['Direct_CPR'] = display_attr['Direct_CPR'].apply(lambda x: f"${x:,.0f}" if x < float('inf') else "N/A")
+    display_attr['CPR_Improvement'] = display_attr['CPR_Improvement'].apply(lambda x: f"{x:.2f}x")
+    display_attr['Spend'] = display_attr['Spend'].apply(lambda x: f"${x:,.0f}")
+
+    st.dataframe(
+        display_attr[['Payer', 'Spend', 'Direct_Leads', 'Total_System_Impact',
+                      'Direct_CPR', 'System_CPR', 'CPR_Improvement', 'Avg_Cascade_Depth']],
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # Drill-down selector
+    selected_payer_attr = st.selectbox(
+        "Drill into payer attribution",
+        options=attribution_df['Payer'].tolist(),
+        key="attribution_drilldown"
+    )
+
+    if selected_payer_attr:
+        result = attributor.attribute_spend(selected_payer_attr)
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Direct Leads", f"{result.direct_leads:,}")
+        with col2:
+            st.metric("Total System Impact", f"{result.total_system_impact:,.1f}")
+        with col3:
+            st.metric("Network Multiplier", f"{result.total_system_impact/result.direct_leads:.2f}x" if result.direct_leads > 0 else "N/A")
+
+        # Show cascade distribution
+        if result.hop_distribution:
+            hop_df = pd.DataFrame([
+                {"Hop": f"Hop {k}", "Attributed Leads": v}
+                for k, v in sorted(result.hop_distribution.items())
+            ])
+            fig_hop = px.bar(hop_df, x="Hop", y="Attributed Leads",
+                            color_discrete_sequence=["#22c55e"])
+            fig_hop.update_layout(height=250, margin=dict(l=10, r=10, t=30, b=10))
+            st.plotly_chart(fig_hop, use_container_width=True)
+
+st.markdown('</div>', unsafe_allow_html=True)
+
+# ============================================
+# NEW SECTION: Mathematical Optimization
+# ============================================
+st.markdown('<div class="section-card">', unsafe_allow_html=True)
+st.markdown("**🧮 Mathematical Spend Optimization**")
+
+with st.expander("⚙️ Optimization Parameters", expanded=False):
+    opt_col1, opt_col2, opt_col3 = st.columns(3)
+    with opt_col1:
+        opt_budget = st.number_input("Total Budget ($)", min_value=1000, max_value=1000000,
+                                     value=50000, step=5000, key="opt_budget")
+    with opt_col2:
+        opt_horizon = st.number_input("Horizon (days)", min_value=7, max_value=90,
+                                      value=30, step=7, key="opt_horizon")
+    with opt_col3:
+        opt_pacing_cap = st.slider("Pacing Cap", min_value=1.0, max_value=1.5,
+                                   value=1.2, step=0.05, key="opt_pacing")
+
+if st.button("🚀 Run Optimization", key="run_optimization"):
+    with st.spinner("Solving optimization problem..."):
+        try:
+            result = quick_optimize(events, total_budget=opt_budget, horizon_days=opt_horizon)
+
+            if result.status.value == "optimal":
+                st.success(f"✅ Optimization complete! System CPR: ${result.system_cpr:,.2f}")
+
+                # Summary metrics
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Total Spend", f"${result.total_spend:,.0f}")
+                m2.metric("Expected Referrals", f"{result.total_expected_referrals:,.0f}")
+                m3.metric("Budget Utilization", f"{result.budget_utilization:.0%}")
+                m4.metric("Solve Time", f"{result.solve_time_seconds:.2f}s")
+
+                # Allocations table
+                if result.allocations:
+                    alloc_df = pd.DataFrame([
+                        {
+                            "Source": a.source,
+                            "Target": a.target,
+                            "Period": f"Day {a.period}",
+                            "Amount": f"${a.amount:,.0f}",
+                            "Expected Refs": f"{a.expected_referrals:.1f}",
+                            "Priority": a.priority
+                        }
+                        for a in result.allocations[:20]
+                    ])
+                    st.markdown("**Top Spend Allocations**")
+                    st.dataframe(alloc_df, use_container_width=True, hide_index=True)
+
+                # Timing alerts
+                if result.timing_alerts:
+                    st.markdown("**⏰ Timing Alerts**")
+                    for alert in result.timing_alerts[:5]:
+                        if alert.urgency == "critical":
+                            st.error(f"🚨 {alert.message}")
+                        elif alert.urgency == "warning":
+                            st.warning(f"⚠️ {alert.message}")
+                        else:
+                            st.info(f"ℹ️ {alert.message}")
+            else:
+                st.error(f"Optimization failed: {result.solver_message}")
+
+        except ImportError:
+            st.warning("⚠️ CVXPY not installed. Run: `pip install cvxpy`")
+        except Exception as e:
+            st.error(f"Error: {str(e)}")
 
 st.markdown('</div>', unsafe_allow_html=True)
 

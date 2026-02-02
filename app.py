@@ -42,6 +42,8 @@ def get_available_pages():
                 pages['postcode'] = f"pages/{f.name}"
             elif 'optimization' in name_lower:
                 pages['optimization'] = f"pages/{f.name}"
+            elif 'optimizer' in name_lower:
+                pages['optimizer'] = f"pages/{f.name}"
     
     return pages
 
@@ -163,6 +165,20 @@ def main():
                 st.switch_page(pages['optimization'])
         else:
             st.error("Page not found: pages/5_Referral_Optimization.py")
+
+    with col5:
+        st.markdown("#### 🧮 Spend Optimizer")
+        st.markdown("""
+        Mathematical optimization:
+        - CVXPY-based solver
+        - Full funnel attribution
+        - Scenario planning
+        """)
+        if 'optimizer' in pages:
+            if st.button("🧮 Open Spend Optimizer", key="btn_optimizer", use_container_width=True):
+                st.switch_page(pages['optimizer'])
+        else:
+            st.error("Page not found: pages/6_Spend_Optimizer.py")
 
     col4, col5, col6 = st.columns(3)
     with col4:

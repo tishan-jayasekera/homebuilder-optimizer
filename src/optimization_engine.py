@@ -7,6 +7,7 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 import json
+from .attribution_engine import FullFunnelAttributor, PacingValidator, integrate_with_optimization_engine
 
 
 def _find_col(columns, candidates):
@@ -88,7 +89,7 @@ class ReferralOptimizationEngine:
     Core engine for computing referral network optimization metrics.
     """
 
-    def __init__(self, events_df: pd.DataFrame, origin_perf_df: pd.DataFrame, media_raw_df: pd.DataFrame):
+    def __init__(self, events_df: pd.DataFrame, origin_perf_df: Optional[pd.DataFrame] = None, media_raw_df: Optional[pd.DataFrame] = None):
         """
         Initialize with the three data sources.
 
@@ -98,14 +99,33 @@ class ReferralOptimizationEngine:
             media_raw_df: Daily media spend data
         """
         self.events = events_df.copy()
-        self.origin_perf = origin_perf_df.copy()
-        self.media_raw = media_raw_df.copy()
+        self.origin_perf = origin_perf_df.copy() if origin_perf_df is not None else pd.DataFrame()
+        self.media_raw = media_raw_df.copy() if media_raw_df is not None else pd.DataFrame()
         self.cols = {}
         self.builder_targets = {}
 
         # Preprocess data
         self._preprocess_data()
         self._build_attribution()
+
+        # Initialize full funnel attribution
+        self.attributor = FullFunnelAttributor(self.events)
+        self._attribution_helpers = integrate_with_optimization_engine(self.attributor)
+
+        # Initialize pacing validator
+        self.pacing_validator = PacingValidator(self.events)
+
+    def compute_system_level_cpr(self, payer: str) -> float:
+        """Get system-level CPR including all downstream network effects."""
+        return self._attribution_helpers['compute_system_cpr'](payer)
+
+    def get_full_attribution(self, payer: str):
+        """Get complete attribution result for a payer."""
+        return self.attributor.attribute_spend(payer)
+
+    def validate_builder_pacing(self, builder: str):
+        """Validate pacing feasibility for a builder."""
+        return self.pacing_validator.validate_builder(builder)
 
     def _preprocess_data(self):
         """Clean and prepare data for analysis."""

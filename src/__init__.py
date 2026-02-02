@@ -7,6 +7,22 @@ from .builder_pnl import build_builder_pnl, add_period_cols
 from .orphan_media import run_orphan_analysis
 from .referral_clusters import run_referral_clustering
 from .utils import fmt_currency, fmt_percent, fmt_number
+from .attribution_engine import (
+    FullFunnelAttributor,
+    PacingValidator,
+    VelocityProfile,
+    LagDistribution,
+    AttributionResult,
+    PacingFeasibility
+)
+from .mathematical_optimizer import (
+    MathematicalOptimizer,
+    OptimizationConfig,
+    OptimizationResult,
+    SpendAllocation,
+    TimingAlert,
+    quick_optimize
+)
 
 __all__ = [
     'load_events', 'load_origin_perf', 'load_media_raw',
@@ -14,5 +30,17 @@ __all__ = [
     'build_builder_pnl', 'add_period_cols',
     'run_orphan_analysis',
     'run_referral_clustering',
-    'fmt_currency', 'fmt_percent', 'fmt_number'
+    'fmt_currency', 'fmt_percent', 'fmt_number',
+    'FullFunnelAttributor',
+    'PacingValidator',
+    'VelocityProfile',
+    'LagDistribution',
+    'AttributionResult',
+    'PacingFeasibility',
+    'MathematicalOptimizer',
+    'OptimizationConfig',
+    'OptimizationResult',
+    'SpendAllocation',
+    'TimingAlert',
+    'quick_optimize'
 ]
