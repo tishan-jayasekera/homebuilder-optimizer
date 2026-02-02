@@ -236,17 +236,30 @@ class ReferralOptimizationEngine:
         Returns:
             Attribution string
         """
+        def _find_col(columns, candidates):
+            col_map = {c.lower(): c for c in columns}
+            for cand in candidates:
+                if cand in columns:
+                    return cand
+                if cand.lower() in col_map:
+                    return col_map[cand.lower()]
+            return None
+
         # Check for media spend spike in window around spike_date
         spend_window_start = spike_date - pd.Timedelta(days=abs(lag_metrics.L_media))
         spend_window_end = spike_date + pd.Timedelta(days=abs(lag_metrics.L_media))
 
-        window_spend = self.media_raw[
-            (self.media_raw['Date'] >= spend_window_start) &
-            (self.media_raw['Date'] <= spend_window_end)
-        ]['Amount_spent'].sum()
-
-        avg_daily_spend = self.media_raw['Amount_spent'].mean()
-        spend_spike = window_spend > (1.5 * avg_daily_spend * (spend_window_end - spend_window_start).days)
+        date_col = _find_col(self.media_raw.columns, ['Date', 'date', 'SpendDate', 'spend_date'])
+        spend_col = _find_col(self.media_raw.columns, ['Amount_spent', 'amount_spent', 'Spend', 'spend', 'Cost'])
+        if date_col and spend_col:
+            window_spend = self.media_raw[
+                (self.media_raw[date_col] >= spend_window_start) &
+                (self.media_raw[date_col] <= spend_window_end)
+            ][spend_col].sum()
+            avg_daily_spend = self.media_raw[spend_col].mean()
+            spend_spike = window_spend > (1.5 * avg_daily_spend * (spend_window_end - spend_window_start).days)
+        else:
+            spend_spike = False
 
         # Check for viral surge (one source dominating)
         spike_leads = self.events[self.events['lead_date'] == spike_date]
