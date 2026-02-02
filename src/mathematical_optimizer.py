@@ -525,7 +525,7 @@ def quick_optimize(
         print(f"System CPR: ${result.system_cpr:.2f}")
     """
     # Import here to avoid circular dependency
-    from attribution_engine import FullFunnelAttributor, PacingValidator
+    from .attribution_engine import FullFunnelAttributor, PacingValidator
     
     # Build velocity profiles from events
     attributor = FullFunnelAttributor(events_df)
