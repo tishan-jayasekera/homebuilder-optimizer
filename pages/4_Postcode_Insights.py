@@ -91,8 +91,13 @@ def load_postcode_geo():
     geo_path = Path("data/au-postcodes.geojson")
     if not geo_path.exists():
         return None
-    with geo_path.open() as f:
-        return json.load(f)
+    if geo_path.stat().st_size == 0:
+        return None
+    try:
+        with geo_path.open() as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        return None
 
 
 @st.cache_data(show_spinner=False)
@@ -101,6 +106,11 @@ def load_postcode_meta():
     if not meta_path.exists():
         return None
     df = pd.read_csv(meta_path)
+    if "version https://git-lfs.github.com/spec/v1" in df.columns.tolist() or df.shape[1] == 1:
+        return None
+    required_cols = {"Postcode", "Suburb", "State", "Lat", "Lng"}
+    if not required_cols.issubset(set(df.columns)):
+        return None
     df["Postcode"] = df["Postcode"].astype(str).str.zfill(4)
     df["Suburb"] = df["Suburb"].astype(str).str.strip().str.upper()
     df["State"] = df["State"].astype(str).str.strip().str.upper()

@@ -897,7 +897,7 @@ def main():
         if excluded:
             chips = "".join(f"<span class='chip'>{html.escape(b)}</span>" for b in excluded)
             st.markdown(f"<div class='chip-row'>{chips}</div>", unsafe_allow_html=True)
-            if st.button("Clear excluded", width="stretch"):
+            if st.button("Clear excluded"):
                 st.session_state.excluded_builders = []
                 if st.session_state.targets:
                     st.session_state.targets = []
@@ -915,7 +915,7 @@ def main():
         
         st.markdown("---")
         st.markdown("### Campaign Targets")
-        if st.button("⚠️ Load Critical Targets", width="stretch"):
+        if st.button("⚠️ Load Critical Targets"):
             st.session_state.load_critical_targets = True
         if st.session_state.targets:
             for t in st.session_state.targets:
@@ -1486,7 +1486,7 @@ def main():
         budget = st.number_input("Campaign Budget ($)", min_value=1000, value=50000, step=5000)
     with col2:
         st.write("")
-        if st.button("🎯 Optimize Allocation", type="primary", width="stretch"):
+        if st.button("🎯 Optimize Allocation", type="primary"):
             allocations, summary = optimizer.optimize_basket(targets, budget)
             st.session_state.optimization_result = {'allocations': allocations, 'summary': summary}
     
