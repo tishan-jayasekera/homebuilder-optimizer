@@ -106,7 +106,7 @@ with tab1:
 
                 fig = px.pie(alloc_data, values="Amount", names="Source",
                             title="Spend Allocation by Source")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
         else:
             st.error(f"Optimization failed: {result.solver_message}")
 
@@ -122,7 +122,7 @@ with tab2:
             attr_df["Top_Indirect_Recipients"] = attr_df["Top_Indirect_Recipients"].apply(
                 lambda v: ", ".join([f"{k}: {val:.1f}" for k, val in v]) if isinstance(v, list) else str(v)
             )
-        st.dataframe(attr_df, use_container_width=True)
+        st.dataframe(attr_df, width='stretch')
 
 with tab3:
     st.subheader("Scenario Planning")

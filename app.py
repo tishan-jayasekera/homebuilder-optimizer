@@ -116,7 +116,7 @@ def main():
         - **Origin**: Original lead source
         """)
         if 'pnl' in pages:
-            if st.button("📊 Open Builder P&L", key="btn_pnl", use_container_width=True):
+            if st.button("📊 Open Builder P&L", key="btn_pnl", width='stretch'):
                 st.switch_page(pages['pnl'])
         else:
             st.error("Page not found: pages/1_Builder_PnL.py")
@@ -130,7 +130,7 @@ def main():
         - Active vs Paused analysis
         """)
         if 'orphan' in pages:
-            if st.button("🎯 Open Orphan Media", key="btn_orphan", use_container_width=True):
+            if st.button("🎯 Open Orphan Media", key="btn_orphan", width='stretch'):
                 st.switch_page(pages['orphan'])
         else:
             st.error("Page not found: pages/2_Orphan_Media.py")
@@ -144,7 +144,7 @@ def main():
         - Media efficiency pathfinding
         """)
         if 'network' in pages:
-            if st.button("🔗 Open Referral Networks", key="btn_network", use_container_width=True):
+            if st.button("🔗 Open Referral Networks", key="btn_network", width='stretch'):
                 st.switch_page(pages['network'])
         else:
             st.error("Page not found: pages/3_Referral_Networks.py")
@@ -161,7 +161,7 @@ def main():
         - Optimization scoring
         """)
         if 'optimization' in pages:
-            if st.button("🧭 Open Referral Optimization", key="btn_optimization", use_container_width=True):
+            if st.button("🧭 Open Referral Optimization", key="btn_optimization", width='stretch'):
                 st.switch_page(pages['optimization'])
         else:
             st.error("Page not found: pages/5_Referral_Optimization.py")
@@ -175,7 +175,7 @@ def main():
         - Scenario planning
         """)
         if 'optimizer' in pages:
-            if st.button("🧮 Open Spend Optimizer", key="btn_optimizer", use_container_width=True):
+            if st.button("🧮 Open Spend Optimizer", key="btn_optimizer", width='stretch'):
                 st.switch_page(pages['optimizer'])
         else:
             st.error("Page not found: pages/6_Spend_Optimizer.py")
@@ -190,7 +190,7 @@ def main():
         - Opportunity targeting guidance
         """)
         if 'postcode' in pages:
-            if st.button("📍 Open Postcode Insights", key="btn_postcode", use_container_width=True):
+            if st.button("📍 Open Postcode Insights", key="btn_postcode", width='stretch'):
                 st.switch_page(pages['postcode'])
         else:
             st.error("Page not found: pages/4_Postcode_Insights.py")

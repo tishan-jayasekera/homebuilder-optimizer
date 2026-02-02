@@ -149,7 +149,7 @@ def render_overview(orphan_trend: pd.DataFrame):
         height=400,
         legend=dict(orientation="h", yanchor="bottom", y=1.02)
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
     
     # Spend breakdown
     st.subheader("Monthly Spend Breakdown")
@@ -173,7 +173,7 @@ def render_overview(orphan_trend: pd.DataFrame):
     fig2.update_layout(barmode="stack", height=400)
     fig2.update_yaxes(title_text="Spend ($)", secondary_y=False)
     fig2.update_yaxes(title_text="Orphan %", tickformat=".0%", secondary_y=True)
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(fig2, width='stretch')
 
 
 def render_payer_drilldown(orphan_by_payer: pd.DataFrame):
@@ -240,7 +240,7 @@ def render_payer_drilldown(orphan_by_payer: pd.DataFrame):
     fig.update_layout(barmode="stack", height=400, title=f"Spend & Orphan Share - {selected_payer}")
     fig.update_yaxes(title_text="Spend", secondary_y=False)
     fig.update_yaxes(title_text="Orphan %", tickformat=".0%", secondary_y=True)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
     
     # Worst payer-months table
     st.subheader("Worst Performing Payer-Months")
@@ -256,7 +256,7 @@ def render_payer_drilldown(orphan_by_payer: pd.DataFrame):
             "OrphanShare": "{:.1%}"
         }),
         hide_index=True,
-        use_container_width=True
+        width='stretch'
     )
 
 
@@ -284,7 +284,7 @@ def render_kill_lists(zero_leads: pd.DataFrame, utm_no_ref: pd.DataFrame):
                 st.dataframe(
                     zero_leads[display_cols].head(50).style.format({"S_month": "${:,.0f}"} if "S_month" in display_cols else {}),
                     hide_index=True,
-                    use_container_width=True,
+                    width='stretch',
                     height=400
                 )
             
@@ -319,7 +319,7 @@ def render_kill_lists(zero_leads: pd.DataFrame, utm_no_ref: pd.DataFrame):
                 st.dataframe(
                     utm_no_ref[display_cols].head(50).style.format(format_dict),
                     hide_index=True,
-                    use_container_width=True,
+                    width='stretch',
                     height=400
                 )
             
