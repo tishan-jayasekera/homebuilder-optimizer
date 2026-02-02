@@ -74,17 +74,28 @@ class ReferralOptimizationEngine:
 
     def _preprocess_data(self):
         """Clean and prepare data for analysis."""
+        def _find_col(columns, candidates):
+            col_map = {c.lower(): c for c in columns}
+            for cand in candidates:
+                if cand in columns:
+                    return cand
+                if cand.lower() in col_map:
+                    return col_map[cand.lower()]
+            return None
+
         # Ensure date columns are datetime
         date_cols = ['lead_date', 'RefDate']
         for col in date_cols:
             if col in self.events.columns:
                 self.events[col] = pd.to_datetime(self.events[col], errors='coerce')
 
-        if 'Date' in self.media_raw.columns:
-            self.media_raw['Date'] = pd.to_datetime(self.media_raw['Date'], errors='coerce')
+        media_date_col = _find_col(self.media_raw.columns, ['Date', 'date', 'SpendDate', 'spend_date'])
+        if media_date_col:
+            self.media_raw[media_date_col] = pd.to_datetime(self.media_raw[media_date_col], errors='coerce')
 
-        if 'month_start' in self.origin_perf.columns:
-            self.origin_perf['month_start'] = pd.to_datetime(self.origin_perf['month_start'], errors='coerce')
+        origin_month_col = _find_col(self.origin_perf.columns, ['month_start', 'MonthStart', 'month', 'Month'])
+        if origin_month_col:
+            self.origin_perf[origin_month_col] = pd.to_datetime(self.origin_perf[origin_month_col], errors='coerce')
 
         # Fill missing boolean columns
         bool_cols = ['is_origin', 'is_referral']
@@ -133,17 +144,31 @@ class ReferralOptimizationEngine:
         if self.media_raw.empty or self.events.empty:
             return 0
 
+        def _find_col(columns, candidates):
+            col_map = {c.lower(): c for c in columns}
+            for cand in candidates:
+                if cand in columns:
+                    return cand
+                if cand.lower() in col_map:
+                    return col_map[cand.lower()]
+            return None
+
+        date_col = _find_col(self.media_raw.columns, ['Date', 'date', 'SpendDate', 'spend_date'])
+        spend_col = _find_col(self.media_raw.columns, ['Amount_spent', 'amount_spent', 'Spend', 'spend', 'Cost'])
+        if not date_col or not spend_col:
+            return 0
+
         # Aggregate daily spend
-        daily_spend = self.media_raw.groupby('Date')['Amount_spent'].sum().reset_index()
+        daily_spend = self.media_raw.groupby(date_col)[spend_col].sum().reset_index()
 
         # Aggregate daily leads
         daily_leads = self.events.groupby('lead_date').size().reset_index(name='lead_count')
 
         # Merge on date
-        merged = pd.merge(daily_spend, daily_leads, left_on='Date', right_on='lead_date', how='outer').fillna(0)
+        merged = pd.merge(daily_spend, daily_leads, left_on=date_col, right_on='lead_date', how='outer').fillna(0)
 
         # Compute cross-correlation for lags from -30 to +30 days
-        spend_series = merged['Amount_spent'].values
+        spend_series = merged[spend_col].values
         lead_series = merged['lead_count'].values
 
         max_corr = 0
@@ -320,17 +345,36 @@ class ReferralOptimizationEngine:
         if self.events.empty or self.origin_perf.empty:
             return []
 
+        def _find_col(columns, candidates):
+            col_map = {c.lower(): c for c in columns}
+            for cand in candidates:
+                if cand in columns:
+                    return cand
+                if cand.lower() in col_map:
+                    return col_map[cand.lower()]
+            return None
+
+        payer_col = _find_col(self.events.columns, ['MediaPayer_BuilderRegionKey', 'MediaPayer', 'Payer', 'media_payer'])
+        if not payer_col:
+            return []
+
+        ad_key_col = _find_col(self.events.columns, ['ad_key', 'AdKey', 'campaign_key', 'CampaignKey'])
+        origin_ad_col = _find_col(self.origin_perf.columns, ['ad_key', 'AdKey', 'campaign_key', 'CampaignKey'])
+        spend_col = _find_col(self.origin_perf.columns, ['monthly spend', 'Monthly Spend', 'S_month', 'Spend', 'spend'])
+
         # Group by media payer
-        payers = self.events['MediaPayer_BuilderRegionKey'].dropna().unique()
+        payers = self.events[payer_col].dropna().unique()
 
         scores = []
         for payer in payers:
-            payer_events = self.events[self.events['MediaPayer_BuilderRegionKey'] == payer]
+            payer_events = self.events[self.events[payer_col] == payer]
 
             # Get spend data
-            payer_spend = self.origin_perf[self.origin_perf['ad_key'].isin(
-                payer_events.get('ad_key', pd.Series())
-            )]['monthly spend'].sum()
+            payer_spend = 0.0
+            if origin_ad_col and spend_col and ad_key_col and ad_key_col in payer_events.columns:
+                payer_spend = self.origin_perf[self.origin_perf[origin_ad_col].isin(
+                    payer_events[ad_key_col].dropna()
+                )][spend_col].sum()
 
             # Direct leads
             direct_leads = payer_events['is_origin'].sum()
