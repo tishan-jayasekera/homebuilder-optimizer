@@ -1,3 +1,10 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:02503829575e5110d8cb73f5232e0931221aa6ff9a454e13831e1e5dc0ba88f4
-size 161
+streamlit>=1.28.0
+pandas>=2.0.0
+numpy>=1.24.0
+plotly>=5.18.0
+networkx>=3.1
+python-louvain>=0.16
+openpyxl>=3.1.0
+xlsxwriter>=3.1.0
+matplotlib>=3.7.0
+scipy>=1.11.0
