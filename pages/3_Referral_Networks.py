@@ -12,6 +12,7 @@ import html
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
 import sys
+import subprocess
 from pathlib import Path
 
 root = Path(__file__).parent.parent
@@ -25,6 +26,13 @@ from src.builder_pnl import build_builder_pnl
 from src.network_optimization import calculate_shortfalls, analyze_network_leverage, build_prescriptive_plan, compute_lag_metrics_simple
 
 st.set_page_config(page_title="Referral Network Analysis", page_icon="🔗", layout="wide")
+
+def _build_sha():
+    try:
+        out = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=root)
+        return out.decode().strip()
+    except Exception:
+        return "unknown"
 
 # ============================================================================
 # STYLES
@@ -962,6 +970,7 @@ def main():
         <p class="page-subtitle">Algorithmic path optimization for efficient media allocation</p>
     </div>
     """, unsafe_allow_html=True)
+    st.caption(f"Build: `{_build_sha()}`")
     
     # ========================================================================
     # SECTION 1: NETWORK OVERVIEW
@@ -1704,6 +1713,13 @@ def main():
 
         if plan_df.empty:
             st.caption("No prescriptive recommendations available yet.")
+            st.caption(f"Shortfalls rows: {len(sf)} | Leverage rows: {len(data['leverage'])}")
+            missing_cols = []
+            for col in ["MediaPayer_BuilderRegionKey", "Dest_BuilderRegionKey", "LeadTarget_from_job", "WIP_JOB_LIVE_END"]:
+                if col not in data["events"].columns:
+                    missing_cols.append(col)
+            if missing_cols:
+                st.caption("Missing columns in Events: " + ", ".join(missing_cols))
         else:
             plan_df["Required Budget"] = plan_df["Required Budget"].map(lambda v: f"${v:,.0f}")
             plan_df["Transfer Rate"] = plan_df["Transfer Rate"].map(lambda v: f"{v:.0%}")

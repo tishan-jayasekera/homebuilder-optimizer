@@ -10,6 +10,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import subprocess
 
 ROOT = Path(__file__).parent.parent
 if str(ROOT) not in sys.path:
@@ -26,6 +27,13 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+def _build_sha():
+    try:
+        out = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT)
+        return out.decode().strip()
+    except Exception:
+        return "unknown"
 
 st.markdown(
     """
@@ -47,6 +55,7 @@ st.markdown(
     '<div class="page-subtitle">Lag, spikes, pacing, and ROI-style optimization scoring across the referral network.</div>',
     unsafe_allow_html=True,
 )
+st.caption(f"Build: `{_build_sha()}`")
 
 
 @st.cache_data(show_spinner=False)
