@@ -850,7 +850,10 @@ class ReferralOptimizationEngine:
         pacing_upper: float = 1.2,
         pacing_lower: float = 0.8,
         lead_target_scale: float = 1.0,
-        start_date: Optional[pd.Timestamp] = None
+        start_date: Optional[pd.Timestamp] = None,
+        max_delivery_rows: int = 200000,
+        max_schedule_rows: int = 50000,
+        max_builders_per_ad: int = 200
     ) -> FastOptimizationResult:
         """
         Fast heuristic allocator for spend planning with traceability.
@@ -992,21 +995,41 @@ class ReferralOptimizationEngine:
         delivery_rows = []
         spend_schedule_rows = []
         expected_by_builder = {}
+        max_lag_days = min(30, horizon_days)
+        notes = []
         if not allocations_df.empty:
             date_index = pd.date_range(start_date, horizon_end, freq="D")
+            avg_dest_per_ad = (
+                dest_shares.groupby(ad_col)[dest_col].nunique().mean()
+                if not dest_shares.empty else 0
+            )
+            est_delivery_rows = int(
+                len(allocations_df) * len(date_index) * (max_lag_days + 1) * max(avg_dest_per_ad, 1)
+            )
+            est_schedule_rows = int(len(allocations_df) * len(date_index))
+            if est_delivery_rows > max_delivery_rows:
+                delivery_rows = None
+                notes.append("Skipped expected-delivery detail due to size. Reduce horizon or sources.")
+            if est_schedule_rows > max_schedule_rows:
+                spend_schedule_rows = None
+                notes.append("Skipped spend schedule detail due to size. Reduce horizon or sources.")
             for _, alloc in allocations_df.iterrows():
                 ad_key = alloc["ad_key"]
                 spend = alloc["spend"]
                 lpd = alloc["leads_per_dollar"]
                 spend_per_day = spend / max(len(date_index), 1)
-                curve = self._build_lag_curve(ad_key, max_lag_days=30)
-                share_df = dest_shares[dest_shares[ad_col] == ad_key]
-                for day in date_index:
-                    spend_schedule_rows.append({
-                        "date": day,
-                        "ad_key": ad_key,
-                        "spend": spend_per_day
-                    })
+                curve = self._build_lag_curve(ad_key, max_lag_days=max_lag_days)
+                share_df = dest_shares[dest_shares[ad_col] == ad_key].sort_values("share", ascending=False)
+                if max_builders_per_ad and len(share_df) > max_builders_per_ad:
+                    share_df = share_df.head(max_builders_per_ad)
+                    notes.append(f"Truncated destination share list for {ad_key} to top {max_builders_per_ad}.")
+                if spend_schedule_rows is not None:
+                    for day in date_index:
+                        spend_schedule_rows.append({
+                            "date": day,
+                            "ad_key": ad_key,
+                            "spend": spend_per_day
+                        })
                 for _, srow in share_df.iterrows():
                     builder = srow[dest_col]
                     share = srow["share"]
@@ -1014,20 +1037,21 @@ class ReferralOptimizationEngine:
                         continue
                     expected_total = spend * lpd * share
                     expected_by_builder[builder] = expected_by_builder.get(builder, 0.0) + expected_total
-                    for day in date_index:
-                        for lag, weight in enumerate(curve):
-                            delivery_day = day + pd.Timedelta(days=lag)
-                            if delivery_day > horizon_end:
-                                continue
-                            expected = spend_per_day * lpd * share * weight
-                        delivery_rows.append({
-                            "date": delivery_day,
-                            "builder": builder,
-                            "ad_key": ad_key,
-                            "expected_leads": expected
-                        })
+                    if delivery_rows is not None:
+                        for day in date_index:
+                            for lag, weight in enumerate(curve):
+                                delivery_day = day + pd.Timedelta(days=lag)
+                                if delivery_day > horizon_end:
+                                    continue
+                                expected = spend_per_day * lpd * share * weight
+                                delivery_rows.append({
+                                    "date": delivery_day,
+                                    "builder": builder,
+                                    "ad_key": ad_key,
+                                    "expected_leads": expected
+                                })
 
-        expected_delivery = pd.DataFrame(delivery_rows)
+        expected_delivery = pd.DataFrame(delivery_rows) if delivery_rows else pd.DataFrame()
         if not expected_delivery.empty:
             expected_delivery = (
                 expected_delivery.groupby(["date", "builder", "ad_key"])
@@ -1054,12 +1078,12 @@ class ReferralOptimizationEngine:
             "ad_performance": perf,
             "allocation_summary": allocations_df,
             "destination_shares": dest_shares,
-            "spend_schedule": pd.DataFrame(spend_schedule_rows)
+            "spend_schedule": pd.DataFrame(spend_schedule_rows) if spend_schedule_rows else pd.DataFrame()
         }
 
         return FastOptimizationResult(
             status="ok",
-            message="Fast optimization completed.",
+            message="Fast optimization completed." + (" " + " ".join(notes) if notes else ""),
             allocations=allocations_df,
             expected_delivery=expected_delivery,
             leakage_summary=leakage_summary,
