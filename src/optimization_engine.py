@@ -84,6 +84,16 @@ class OptimizationScore:
     total_score: float
 
 
+@dataclass
+class FastOptimizationResult:
+    status: str
+    message: str
+    allocations: pd.DataFrame
+    expected_delivery: pd.DataFrame
+    leakage_summary: pd.DataFrame
+    trace: Dict[str, pd.DataFrame]
+
+
 class ReferralOptimizationEngine:
     """
     Core engine for computing referral network optimization metrics.
@@ -791,6 +801,270 @@ class ReferralOptimizationEngine:
         # Sort by total score descending
         scores.sort(key=lambda x: x.total_score, reverse=True)
         return scores
+
+    def _builder_windows(self) -> Dict[str, Tuple[pd.Timestamp, pd.Timestamp]]:
+        dest_col = self.cols.get("dest_builder")
+        lead_date_col = self.cols.get("lead_date")
+        start_col = self.cols.get("job_start")
+        end_col = self.cols.get("job_end")
+        if not dest_col:
+            return {}
+        windows = {}
+        for builder, rows in self.events.dropna(subset=[dest_col]).groupby(dest_col):
+            start = rows[start_col].dropna().min() if start_col and start_col in rows.columns else pd.NaT
+            end = rows[end_col].dropna().max() if end_col and end_col in rows.columns else pd.NaT
+            if pd.isna(start) and lead_date_col and lead_date_col in rows.columns:
+                start = rows[lead_date_col].dropna().min()
+            if pd.isna(end) and lead_date_col and lead_date_col in rows.columns:
+                end = rows[lead_date_col].dropna().max()
+            if pd.isna(start):
+                start = pd.Timestamp.now().normalize()
+            if pd.isna(end):
+                end = pd.Timestamp.now().normalize()
+            windows[builder] = (pd.to_datetime(start), pd.to_datetime(end))
+        return windows
+
+    def _build_lag_curve(self, ad_key: str, max_lag_days: int = 30) -> np.ndarray:
+        ad_col = self.cols.get("ad_key")
+        lead_date_col = self.cols.get("lead_date")
+        ref_date_col = self.cols.get("ref_date")
+        if not ad_col or not lead_date_col or not ref_date_col:
+            median = 7
+        else:
+            subset = self.events[self.events[ad_col] == ad_key]
+            lags = (subset[ref_date_col] - subset[lead_date_col]).dt.days
+            lags = lags[(lags.notna()) & (lags >= 0) & (lags <= max_lag_days)]
+            median = int(lags.median()) if not lags.empty else 7
+        curve = np.zeros(max_lag_days + 1)
+        for d in range(max_lag_days + 1):
+            curve[d] = np.exp(-abs(d - median) / 7)
+        if curve.sum() == 0:
+            curve[0] = 1.0
+        return curve / curve.sum()
+
+    def fast_optimize_spend(
+        self,
+        total_budget: float,
+        horizon_days: int = 30,
+        max_source_share: float = 0.4,
+        pacing_upper: float = 1.2,
+        pacing_lower: float = 0.8,
+        lead_target_scale: float = 1.0,
+        start_date: Optional[pd.Timestamp] = None
+    ) -> FastOptimizationResult:
+        """
+        Fast heuristic allocator for spend planning with traceability.
+        Produces allocation plan, expected delivery by day, and leakage.
+        """
+        ad_col = self.cols.get("ad_key")
+        dest_col = self.cols.get("dest_builder")
+        lead_date_col = self.cols.get("lead_date")
+        cost_col = "MediaCost_referral_event" if "MediaCost_referral_event" in self.events.columns else None
+
+        if self.events.empty or not ad_col or not dest_col or not cost_col:
+            return FastOptimizationResult(
+                status="error",
+                message="Missing required columns for fast optimization.",
+                allocations=pd.DataFrame(),
+                expected_delivery=pd.DataFrame(),
+                leakage_summary=pd.DataFrame(),
+                trace={}
+            )
+
+        if start_date is None:
+            start_date = pd.Timestamp.now().normalize()
+        horizon_end = start_date + pd.Timedelta(days=horizon_days - 1)
+
+        # Builder targets and shortfall
+        windows = self._builder_windows()
+        builder_rows = []
+        builder_shortfall = {}
+        for builder, daily_target in self.builder_targets.items():
+            window = windows.get(builder)
+            if not window:
+                continue
+            win_start, win_end = window
+            eff_start = max(win_start, start_date)
+            eff_end = min(win_end, horizon_end)
+            if eff_end < eff_start:
+                target_total = 0.0
+                days = 0
+            else:
+                days = max((eff_end - eff_start).days + 1, 1)
+                target_total = float(daily_target) * days
+            target_total *= max(lead_target_scale, 0.0)
+            builder_shortfall[builder] = target_total
+            builder_rows.append({
+                "Builder": builder,
+                "DailyTarget": daily_target,
+                "TargetDays": days,
+                "TargetTotal": target_total,
+                "WindowStart": eff_start,
+                "WindowEnd": eff_end
+            })
+        builder_targets_df = pd.DataFrame(builder_rows)
+
+        # Ad performance
+        perf = self.events.groupby(ad_col).agg(
+            total_spend=(cost_col, "sum"),
+            total_leads=(ad_col, "size"),
+        ).reset_index()
+        perf["cpl"] = perf["total_spend"] / perf["total_leads"].replace(0, np.nan)
+        perf["cpl"] = perf["cpl"].fillna(perf["cpl"].max() if perf["cpl"].notna().any() else 100.0)
+        perf["leads_per_dollar"] = 1.0 / perf["cpl"].replace(0, np.nan)
+        perf["leads_per_dollar"] = perf["leads_per_dollar"].fillna(0.01)
+
+        # Destination share per ad
+        dest_counts = (
+            self.events.dropna(subset=[ad_col, dest_col])
+            .groupby([ad_col, dest_col])
+            .size()
+            .reset_index(name="lead_count")
+        )
+        dest_totals = dest_counts.groupby(ad_col)["lead_count"].sum().reset_index(name="total")
+        dest_shares = dest_counts.merge(dest_totals, on=ad_col, how="left")
+        dest_shares["share"] = dest_shares["lead_count"] / dest_shares["total"].replace(0, np.nan)
+        dest_shares["share"] = dest_shares["share"].fillna(0)
+
+        # Sort sources by CPL (ascending)
+        perf = perf.sort_values("cpl", ascending=True)
+
+        allocations = []
+        budget_remaining = float(total_budget)
+        max_per_source = max_source_share * total_budget
+        allocated_by_source: Dict[str, float] = {}
+
+        shortfall_series = pd.Series(builder_shortfall)
+        shortfall_total = shortfall_series.sum()
+
+        perf = perf.merge(
+            dest_shares.groupby(ad_col)["share"].sum().reset_index(name="has_share"),
+            on=ad_col,
+            how="left"
+        )
+        perf["has_share"] = perf["has_share"].fillna(0)
+
+        # Compute shortfall-weighted score per source
+        scores = {}
+        for _, row in perf.iterrows():
+            ad_key = row[ad_col]
+            if row["has_share"] <= 0:
+                continue
+            lpd = row["leads_per_dollar"]
+            share_df = dest_shares[dest_shares[ad_col] == ad_key]
+            weighted = 0.0
+            for _, srow in share_df.iterrows():
+                builder = srow[dest_col]
+                share = srow["share"]
+                weighted += share * builder_shortfall.get(builder, 0.0)
+            scores[ad_key] = lpd * weighted
+
+        active = [k for k, v in scores.items() if v > 0]
+        while budget_remaining > 0 and active:
+            total_score = sum(scores[k] for k in active)
+            if total_score <= 0:
+                break
+            spent_this_round = 0.0
+            for ad_key in list(active):
+                cap_left = max_per_source - allocated_by_source.get(ad_key, 0.0)
+                if cap_left <= 0:
+                    active.remove(ad_key)
+                    continue
+                proposed = budget_remaining * (scores[ad_key] / total_score)
+                spend = min(proposed, cap_left)
+                if spend <= 0:
+                    continue
+                allocations.append({
+                    "ad_key": ad_key,
+                    "spend": spend,
+                    "leads_per_dollar": perf.loc[perf[ad_col] == ad_key, "leads_per_dollar"].values[0],
+                    "score": scores[ad_key]
+                })
+                allocated_by_source[ad_key] = allocated_by_source.get(ad_key, 0.0) + spend
+                budget_remaining -= spend
+                spent_this_round += spend
+            if spent_this_round <= 0:
+                break
+
+        allocations_df = pd.DataFrame(allocations)
+
+        # Build expected delivery by day
+        delivery_rows = []
+        spend_schedule_rows = []
+        expected_by_builder = {}
+        if not allocations_df.empty:
+            date_index = pd.date_range(start_date, horizon_end, freq="D")
+            for _, alloc in allocations_df.iterrows():
+                ad_key = alloc["ad_key"]
+                spend = alloc["spend"]
+                lpd = alloc["leads_per_dollar"]
+                spend_per_day = spend / max(len(date_index), 1)
+                curve = self._build_lag_curve(ad_key, max_lag_days=30)
+                share_df = dest_shares[dest_shares[ad_col] == ad_key]
+                for day in date_index:
+                    spend_schedule_rows.append({
+                        "date": day,
+                        "ad_key": ad_key,
+                        "spend": spend_per_day
+                    })
+                for _, srow in share_df.iterrows():
+                    builder = srow[dest_col]
+                    share = srow["share"]
+                    if share <= 0:
+                        continue
+                    expected_total = spend * lpd * share
+                    expected_by_builder[builder] = expected_by_builder.get(builder, 0.0) + expected_total
+                    for day in date_index:
+                        for lag, weight in enumerate(curve):
+                            delivery_day = day + pd.Timedelta(days=lag)
+                            if delivery_day > horizon_end:
+                                continue
+                            expected = spend_per_day * lpd * share * weight
+                        delivery_rows.append({
+                            "date": delivery_day,
+                            "builder": builder,
+                            "ad_key": ad_key,
+                            "expected_leads": expected
+                        })
+
+        expected_delivery = pd.DataFrame(delivery_rows)
+        if not expected_delivery.empty:
+            expected_delivery = (
+                expected_delivery.groupby(["date", "builder", "ad_key"])
+                .agg(expected_leads=("expected_leads", "sum"))
+                .reset_index()
+            )
+
+        # Leakage summary: referrals to builders without shortfall or excess
+        leakage_rows = []
+        for builder, expected in expected_by_builder.items():
+            shortfall = builder_shortfall.get(builder, 0.0)
+            leakage = max(expected - shortfall, 0.0)
+            if leakage > 0:
+                leakage_rows.append({
+                    "builder": builder,
+                    "leakage_leads": leakage,
+                    "expected_leads": expected,
+                    "shortfall": shortfall
+                })
+        leakage_summary = pd.DataFrame(leakage_rows).sort_values("leakage_leads", ascending=False)
+
+        trace = {
+            "builder_targets": builder_targets_df,
+            "ad_performance": perf,
+            "allocation_summary": allocations_df,
+            "destination_shares": dest_shares,
+            "spend_schedule": pd.DataFrame(spend_schedule_rows)
+        }
+
+        return FastOptimizationResult(
+            status="ok",
+            message="Fast optimization completed.",
+            allocations=allocations_df,
+            expected_delivery=expected_delivery,
+            leakage_summary=leakage_summary,
+            trace=trace
+        )
 
     def get_manifest(self) -> str:
         """

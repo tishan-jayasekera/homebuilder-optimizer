@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
 from src.data_loader import load_events
 from src.normalization import normalize_events
 from src.attribution_engine import FullFunnelAttributor, PacingValidator
+from src.optimization_engine import ReferralOptimizationEngine
 from src.mathematical_optimizer import (
     MathematicalOptimizer,
     OptimizationConfig,
@@ -125,6 +126,51 @@ with tab1:
                 st.plotly_chart(fig, use_container_width=True)
         else:
             st.error(f"Optimization failed: {result.solver_message}")
+
+    st.divider()
+    st.subheader("Fast Optimizer (Traceable)")
+
+    if st.button("⚡ Run Fast Optimizer"):
+        with st.spinner("Running fast optimizer..."):
+            engine = ReferralOptimizationEngine(events)
+            fast_result = engine.fast_optimize_spend(
+                total_budget=total_budget,
+                horizon_days=horizon_days,
+                max_source_share=max_source_share,
+                pacing_upper=pacing_upper,
+                pacing_lower=pacing_lower,
+                lead_target_scale=lead_target_scale
+            )
+
+        if fast_result.status == "ok":
+            st.success("✅ Fast optimization completed!")
+            st.caption(fast_result.message)
+
+            if not fast_result.allocations.empty:
+                st.subheader("Spend Plan (by ad_key)")
+                st.dataframe(fast_result.allocations, use_container_width=True)
+                schedule = fast_result.trace.get("spend_schedule")
+                if isinstance(schedule, pd.DataFrame) and not schedule.empty:
+                    st.subheader("Spend Schedule (by day)")
+                    st.dataframe(schedule, use_container_width=True)
+            else:
+                st.warning("No allocations generated. Check targets and data coverage.")
+
+            if not fast_result.expected_delivery.empty:
+                st.subheader("Expected Delivery (by day)")
+                st.dataframe(fast_result.expected_delivery, use_container_width=True)
+
+            if not fast_result.leakage_summary.empty:
+                st.subheader("Leakage Summary")
+                st.dataframe(fast_result.leakage_summary, use_container_width=True)
+
+            with st.expander("Traceability Details", expanded=False):
+                for name, df in fast_result.trace.items():
+                    st.markdown(f"**{name}**")
+                    if isinstance(df, pd.DataFrame) and not df.empty:
+                        st.dataframe(df, use_container_width=True)
+        else:
+            st.error(f"Fast optimizer failed: {fast_result.message}")
 
 with tab2:
     st.subheader("Full Funnel Attribution")
