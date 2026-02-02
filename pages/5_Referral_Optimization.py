@@ -484,11 +484,26 @@ with st.expander("⚙️ Optimization Parameters", expanded=False):
     with opt_col3:
         opt_pacing_cap = st.slider("Pacing Cap", min_value=1.0, max_value=1.5,
                                    value=1.2, step=0.05, key="opt_pacing")
+    st.divider()
+    limit_col1, limit_col2, limit_col3 = st.columns(3)
+    with limit_col1:
+        opt_max_sources = st.number_input("Max Sources", min_value=5, max_value=100, value=25, step=5, key="opt_max_sources")
+    with limit_col2:
+        opt_max_builders = st.number_input("Max Builders", min_value=5, max_value=100, value=25, step=5, key="opt_max_builders")
+    with limit_col3:
+        opt_max_periods = st.number_input("Max Periods (days)", min_value=7, max_value=90, value=30, step=7, key="opt_max_periods")
 
 if st.button("🚀 Run Optimization", key="run_optimization"):
     with st.spinner("Solving optimization problem..."):
         try:
-            result = quick_optimize(events, total_budget=opt_budget, horizon_days=opt_horizon)
+            result = quick_optimize(
+                events,
+                total_budget=opt_budget,
+                horizon_days=opt_horizon,
+                max_sources=opt_max_sources,
+                max_builders=opt_max_builders,
+                max_periods=opt_max_periods
+            )
 
             if result.status.value == "optimal":
                 st.success(f"✅ Optimization complete! System CPR: ${result.system_cpr:,.2f}")

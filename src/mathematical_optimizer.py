@@ -512,7 +512,11 @@ class MathematicalOptimizer:
 def quick_optimize(
     events_df: pd.DataFrame,
     total_budget: float,
-    horizon_days: int = 30
+    horizon_days: int = 30,
+    max_sources: int = 25,
+    max_builders: int = 25,
+    max_periods: int = 30,
+    solver: str = "ECOS"
 ) -> OptimizationResult:
     """
     Quick optimization using defaults.
@@ -526,11 +530,40 @@ def quick_optimize(
     """
     # Import here to avoid circular dependency
     from .attribution_engine import FullFunnelAttributor, PacingValidator
-    
+
+    def _find_col(columns, candidates):
+        col_map = {c.lower(): c for c in columns}
+        for cand in candidates:
+            if cand in columns:
+                return cand
+            if cand.lower() in col_map:
+                return col_map[cand.lower()]
+        return None
+
+    if max_periods is not None:
+        horizon_days = min(horizon_days, max_periods)
+
+    # Limit sources/builders to keep the problem tractable
+    payer_col = _find_col(events_df.columns, ['MediaPayer_BuilderRegionKey', 'Payer', 'payer'])
+    builder_col = _find_col(events_df.columns, ['Dest_BuilderRegionKey', 'BuilderRegionKey', 'builder'])
+    filtered_events = events_df
+
+    if payer_col and max_sources is not None:
+        payer_counts = events_df[payer_col].value_counts()
+        if len(payer_counts) > max_sources:
+            top_payers = payer_counts.head(max_sources).index
+            filtered_events = filtered_events[filtered_events[payer_col].isin(top_payers)]
+
+    if builder_col and max_builders is not None:
+        builder_counts = events_df[builder_col].value_counts()
+        if len(builder_counts) > max_builders:
+            top_builders = builder_counts.head(max_builders).index
+            filtered_events = filtered_events[filtered_events[builder_col].isin(top_builders)]
+
     # Build velocity profiles from events
-    attributor = FullFunnelAttributor(events_df)
+    attributor = FullFunnelAttributor(filtered_events)
     payer_col = attributor.cols['payer']
-    payers = events_df[payer_col].dropna().unique()
+    payers = filtered_events[payer_col].dropna().unique() if payer_col else []
     
     velocity_profiles = {}
     for payer in payers:
@@ -539,7 +572,7 @@ def quick_optimize(
     
     # Build targets (using defaults if not available)
     builder_col = 'Dest_BuilderRegionKey'
-    builders = events_df[builder_col].dropna().unique() if builder_col in events_df.columns else []
+    builders = filtered_events[builder_col].dropna().unique() if builder_col in filtered_events.columns else []
     
     targets = pd.DataFrame({
         'BuilderRegionKey': builders,
@@ -561,7 +594,8 @@ def quick_optimize(
     # Run optimization
     config = OptimizationConfig(
         total_budget=total_budget,
-        horizon_days=horizon_days
+        horizon_days=horizon_days,
+        solver=solver
     )
     
     return optimizer.optimize(config)

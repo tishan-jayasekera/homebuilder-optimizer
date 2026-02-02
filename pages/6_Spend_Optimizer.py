@@ -62,6 +62,13 @@ with st.sidebar:
         min_value=0.2, max_value=0.8, value=0.4, step=0.05,
         help="No single source gets more than this share of budget")
 
+    st.divider()
+    st.subheader("Quick Optimize Limits")
+    max_sources = st.slider("Max Sources", min_value=5, max_value=100, value=25, step=5)
+    max_builders = st.slider("Max Builders", min_value=5, max_value=100, value=25, step=5)
+    max_periods = st.slider("Max Periods (days)", min_value=7, max_value=90, value=30, step=7)
+    solver = st.selectbox("Solver", options=["ECOS", "SCS", "OSQP"], index=0)
+
 # Main content
 tab1, tab2, tab3 = st.tabs(["🎯 Quick Optimize", "📊 Attribution Analysis", "📈 Scenario Planning"])
 
@@ -70,7 +77,15 @@ with tab1:
 
     if st.button("🚀 Run Quick Optimization", type="primary"):
         with st.spinner("Running optimization..."):
-            result = quick_optimize(events, total_budget=total_budget, horizon_days=horizon_days)
+            result = quick_optimize(
+                events,
+                total_budget=total_budget,
+                horizon_days=horizon_days,
+                max_sources=max_sources,
+                max_builders=max_builders,
+                max_periods=max_periods,
+                solver=solver
+            )
 
         if result.status.value == "optimal":
             st.success("✅ Optimization successful!")
