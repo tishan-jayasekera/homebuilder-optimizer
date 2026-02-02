@@ -46,6 +46,11 @@ class OptimizationConfig:
     verbose: bool = False
     min_budget_utilization: float = 0.0  # Force spending at least X% of budget (0 = no floor)
     fallback_transfer_rate: float = 0.1  # Used when no transition data exists
+    total_lead_target: Optional[float] = None  # Target total referrals/leads over horizon
+    target_slack_penalty: float = 1000.0  # Penalty for missing lead target
+    pacing_checkpoint_days: int = 7  # Enforce pacing lower bounds every N days
+    enforce_pacing_lower: bool = True  # Apply lower pacing bound constraints
+    max_problem_size: int = 200000  # Guardrail for n_sources*n_builders*n_periods
 
 
 @dataclass
@@ -93,6 +98,8 @@ class OptimizationResult:
     solve_time_seconds: float
     iterations: int
     solver_message: str
+    total_lead_target: float
+    lead_target_gap: float
 
 
 class MathematicalOptimizer:
@@ -205,7 +212,9 @@ class MathematicalOptimizer:
                 source_concentration={},
                 solve_time_seconds=0,
                 iterations=0,
-                solver_message="CVXPY not installed. Run: pip install cvxpy"
+                solver_message="CVXPY not installed. Run: pip install cvxpy",
+                total_lead_target=0.0,
+                lead_target_gap=0.0
             )
         
         self.fallback_transfer_rate = config.fallback_transfer_rate
@@ -215,6 +224,11 @@ class MathematicalOptimizer:
         
         if n_sources == 0 or n_builders == 0:
             return self._empty_result("No sources or builders available")
+        if n_sources * n_builders * n_periods > config.max_problem_size:
+            return self._empty_result(
+                f"Problem too large ({n_sources} sources × {n_builders} builders × {n_periods} days). "
+                f"Reduce sources/builders/periods or use Quick Optimize limits."
+            )
         
         # ========================================
         # DECISION VARIABLES
@@ -272,10 +286,16 @@ class MathematicalOptimizer:
         # ========================================
         # OBJECTIVE FUNCTION
         # ========================================
-        # Maximize total referrals (budget utilization handled by constraints)
         total_spend_expr = cp.sum(spend)
         total_refs_expr = cp.sum(referrals)
-        objective = cp.Maximize(total_refs_expr)
+        target_slack = None
+        if config.total_lead_target and config.total_lead_target > 0:
+            # Minimize spend while hitting lead target (slack allows feasibility)
+            target_slack = cp.Variable(nonneg=True)
+            objective = cp.Minimize(total_spend_expr + config.target_slack_penalty * target_slack)
+        else:
+            # Fallback: maximize total referrals under budget
+            objective = cp.Maximize(total_refs_expr)
         
         # ========================================
         # CONSTRAINTS
@@ -285,6 +305,8 @@ class MathematicalOptimizer:
         # 1. Total budget constraint
         constraints.append(total_spend_expr <= config.total_budget)
         constraints.append(total_spend_expr >= config.min_budget_utilization * config.total_budget)
+        if config.total_lead_target and config.total_lead_target > 0:
+            constraints.append(total_refs_expr + target_slack >= config.total_lead_target)
         
         # 2. Pacing constraints for each builder
         for j, builder in enumerate(self.builders):
@@ -305,11 +327,15 @@ class MathematicalOptimizer:
                 constraints.append(
                     cumulative_refs <= config.pacing_upper_bound * cumulative_target
                 )
-                
-                # Lower bound: at least 80% of target (soft - may be infeasible)
-                # constraints.append(
-                #     cumulative_refs >= config.pacing_lower_bound * cumulative_target
-                # )
+            
+            if config.enforce_pacing_lower and config.pacing_lower_bound > 0:
+                step = max(1, config.pacing_checkpoint_days)
+                for t in range(step - 1, n_periods, step):
+                    cumulative_target = daily_target * (t + 1)
+                    cumulative_refs = cp.sum(referrals[j, :t+1])
+                    constraints.append(
+                        cumulative_refs >= config.pacing_lower_bound * cumulative_target
+                    )
         
         # 3. Source diversity constraint (no single source dominates)
         if n_sources * config.max_single_source_share >= 1.0:
@@ -427,6 +453,8 @@ class MathematicalOptimizer:
         total_spend_actual = float(np.sum(spend_values))
         total_refs_actual = float(np.sum(referral_values))
         system_cpr = total_spend_actual / total_refs_actual if total_refs_actual > 0 else float('inf')
+        total_lead_target = float(config.total_lead_target or 0.0)
+        lead_target_gap = total_lead_target - total_refs_actual if total_lead_target > 0 else 0.0
         
         # Source concentration
         source_spends = {}
@@ -455,7 +483,9 @@ class MathematicalOptimizer:
             source_concentration=source_concentration,
             solve_time_seconds=solve_time,
             iterations=problem.solver_stats.num_iters if hasattr(problem, 'solver_stats') else 0,
-            solver_message=f"Solved with {config.solver}"
+            solver_message=f"Solved with {config.solver}",
+            total_lead_target=total_lead_target,
+            lead_target_gap=lead_target_gap
         )
     
     def _empty_result(
@@ -477,7 +507,9 @@ class MathematicalOptimizer:
             source_concentration={},
             solve_time_seconds=0,
             iterations=0,
-            solver_message=message
+            solver_message=message,
+            total_lead_target=0.0,
+            lead_target_gap=0.0
         )
     
     def _generate_timing_alerts(self, config: OptimizationConfig) -> List[TimingAlert]:
@@ -535,7 +567,14 @@ def quick_optimize(
     max_sources: int = 25,
     max_builders: int = 25,
     max_periods: int = 30,
-    solver: str = "SCS"
+    solver: str = "SCS",
+    pacing_upper_bound: float = 1.2,
+    pacing_lower_bound: float = 0.8,
+    max_single_source_share: float = 0.4,
+    min_budget_utilization: float = 0.9,
+    total_lead_target: Optional[float] = None,
+    lead_target_scale: float = 1.0,
+    use_job_targets: bool = True
 ) -> OptimizationResult:
     """
     Quick optimization using defaults.
@@ -589,16 +628,77 @@ def quick_optimize(
         profile = attributor.get_velocity_profile(payer)
         velocity_profiles[payer] = profile
     
-    # Build targets (using defaults if not available)
-    builder_col = 'Dest_BuilderRegionKey'
-    builders = filtered_events[builder_col].dropna().unique() if builder_col in filtered_events.columns else []
-    
-    targets = pd.DataFrame({
-        'BuilderRegionKey': builders,
-        'LeadTarget': 100,  # Default
-        'DailyTarget': 100 / horizon_days,
-        'JobEnd': pd.Timestamp.now() + pd.Timedelta(days=horizon_days)
-    })
+    def _build_targets(df: pd.DataFrame, horizon: int) -> Tuple[pd.DataFrame, float]:
+        builder_col = _find_col(df.columns, ['Dest_BuilderRegionKey', 'BuilderRegionKey', 'builder', 'dest_builder'])
+        target_col = _find_col(df.columns, ['LeadTarget_from_job', 'LeadTarget', 'lead_target'])
+        start_col = _find_col(df.columns, ['WIP_JOB_LIVE_START', 'JobLiveStart', 'JobStart'])
+        end_col = _find_col(df.columns, ['WIP_JOB_LIVE_END', 'JobLiveEnd', 'JobEnd'])
+        lead_date_col = _find_col(df.columns, ['lead_date', 'LeadDate', 'CreatedDate'])
+
+        if not builder_col:
+            return pd.DataFrame(), 0.0
+
+        work = df[[builder_col]].copy()
+        if target_col:
+            work[target_col] = pd.to_numeric(df[target_col], errors="coerce")
+        if start_col:
+            work[start_col] = pd.to_datetime(df[start_col], errors="coerce")
+        if end_col:
+            work[end_col] = pd.to_datetime(df[end_col], errors="coerce")
+        if lead_date_col:
+            work[lead_date_col] = pd.to_datetime(df[lead_date_col], errors="coerce")
+
+        grouped = work.groupby(builder_col, dropna=True)
+        rows = []
+        total_target = 0.0
+        for builder, g in grouped:
+            target = g[target_col].max() if target_col else np.nan
+            if pd.isna(target) or target <= 0:
+                continue
+            start = g[start_col].min() if start_col else pd.NaT
+            end = g[end_col].max() if end_col else pd.NaT
+            if pd.isna(start) and lead_date_col:
+                start = g[lead_date_col].min()
+            if pd.isna(end) and lead_date_col:
+                end = g[lead_date_col].max()
+            if pd.isna(start):
+                start = pd.Timestamp.now()
+            if pd.isna(end):
+                end = pd.Timestamp.now() + pd.Timedelta(days=horizon)
+
+            duration_days = max((end - start).days, 1)
+            daily_target = float(target) / duration_days
+            total_target += daily_target * horizon
+
+            rows.append({
+                "BuilderRegionKey": builder,
+                "LeadTarget": float(target),
+                "DailyTarget": daily_target,
+                "JobEnd": end
+            })
+
+        if not rows:
+            return pd.DataFrame(), 0.0
+        return pd.DataFrame(rows), total_target
+
+    targets = pd.DataFrame()
+    derived_total_target = 0.0
+    if use_job_targets:
+        targets, derived_total_target = _build_targets(filtered_events, horizon_days)
+
+    if targets.empty:
+        builder_col = 'Dest_BuilderRegionKey'
+        builders = filtered_events[builder_col].dropna().unique() if builder_col in filtered_events.columns else []
+        targets = pd.DataFrame({
+            'BuilderRegionKey': builders,
+            'LeadTarget': 100,  # Default
+            'DailyTarget': 100 / max(horizon_days, 1),
+            'JobEnd': pd.Timestamp.now() + pd.Timedelta(days=horizon_days)
+        })
+        derived_total_target = float(len(builders) * 100)
+
+    if total_lead_target is None or total_lead_target <= 0:
+        total_lead_target = derived_total_target * max(lead_target_scale, 0.0)
     
     # Get transition matrix
     transition_matrix = attributor.transition_matrix
@@ -615,7 +715,11 @@ def quick_optimize(
         total_budget=total_budget,
         horizon_days=horizon_days,
         solver=solver,
-        min_budget_utilization=0.9
+        min_budget_utilization=min_budget_utilization,
+        pacing_upper_bound=pacing_upper_bound,
+        pacing_lower_bound=pacing_lower_bound,
+        max_single_source_share=max_single_source_share,
+        total_lead_target=total_lead_target
     )
 
     result = optimizer.optimize(config)

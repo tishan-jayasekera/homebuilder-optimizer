@@ -62,6 +62,15 @@ with st.sidebar:
         min_value=0.2, max_value=0.8, value=0.4, step=0.05,
         help="No single source gets more than this share of budget")
 
+    use_job_targets = st.checkbox("Use Job Lead Targets", value=True,
+        help="Derive lead targets from LeadTarget_from_job / LeadTarget fields")
+    lead_target_scale = st.slider("Lead Target Scale",
+        min_value=0.5, max_value=2.0, value=1.0, step=0.05,
+        help="Scale derived lead targets up/down")
+    total_lead_target_override = st.number_input("Total Lead Target Override",
+        min_value=0, max_value=1000000, value=0, step=100,
+        help="Optional override for total lead target (0 = use derived)")
+
     st.divider()
     st.subheader("Quick Optimize Limits")
     max_sources = st.slider("Max Sources", min_value=5, max_value=100, value=25, step=5)
@@ -84,7 +93,13 @@ with tab1:
                 max_sources=max_sources,
                 max_builders=max_builders,
                 max_periods=max_periods,
-                solver=solver
+                solver=solver,
+                pacing_upper_bound=pacing_upper,
+                pacing_lower_bound=pacing_lower,
+                max_single_source_share=max_source_share,
+                total_lead_target=total_lead_target_override,
+                lead_target_scale=lead_target_scale,
+                use_job_targets=use_job_targets
             )
 
         if result.status.value == "optimal":
@@ -94,8 +109,9 @@ with tab1:
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("System CPR", f"${result.system_cpr:,.2f}")
             c2.metric("Total Referrals", f"{result.total_expected_referrals:,.0f}")
-            c3.metric("Budget Used", f"{result.budget_utilization:.0%}")
+            c3.metric("Target Referrals", f"{result.total_lead_target:,.0f}")
             c4.metric("Solve Time", f"{result.solve_time_seconds:.2f}s")
+            st.caption(f"Budget Utilization: {result.budget_utilization:.0%} | Target Gap: {result.lead_target_gap:,.0f}")
 
             # Allocation chart
             if result.allocations:
