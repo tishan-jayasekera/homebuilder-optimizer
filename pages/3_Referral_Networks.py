@@ -18,11 +18,12 @@ root = Path(__file__).parent.parent
 if str(root) not in sys.path:
     sys.path.insert(0, str(root))
 
-from src.data_loader import load_events, export_to_excel
+from src.data_loader import load_events, export_to_excel, load_all_data
 from src.normalization import normalize_events
 from src.referral_clusters import run_referral_clustering
 from src.builder_pnl import build_builder_pnl
 from src.network_optimization import calculate_shortfalls, analyze_network_leverage
+from src.optimization_engine import ReferralOptimizationEngine
 
 st.set_page_config(page_title="Referral Network Analysis", page_icon="🔗", layout="wide")
 
@@ -842,8 +843,8 @@ def build_budget_flow_dot(allocations, target_analyses, total_budget, unallocate
 # MAIN APPLICATION
 # ============================================================================
 def main():
-    events_file = st.session_state.get("events_file")
-    events = load_data(events_file)
+    all_data = load_all_data()
+    events = all_data.get('events')
     
     if events is None:
         st.warning("⚠️ Please upload Events data on the Home page.")
@@ -929,6 +930,14 @@ def main():
     # Initialize optimizer
     optimizer = NetworkOptimizer(data['events'], G, bm, sf, data['leverage'])
     
+    # Initialize optimization engine
+    origin_perf = all_data.get('origin_perf')
+    media_raw = all_data.get('media_raw')
+    if origin_perf is not None and media_raw is not None:
+        opt_engine = ReferralOptimizationEngine(events, origin_perf, media_raw)
+    else:
+        opt_engine = None
+    
     # ========================================================================
     # HEADER
     # ========================================================================
@@ -938,6 +947,14 @@ def main():
         <p class="page-subtitle">Algorithmic path optimization for efficient media allocation</p>
     </div>
     """, unsafe_allow_html=True)
+
+    # Create tabs
+    tab_network, tab_optimization = st.tabs(["🔗 Network Analysis", "⚡ Optimization Engine"])
+
+    # ========================================================================
+    # TAB 1: NETWORK ANALYSIS
+    # ========================================================================
+    with tab_network:
     
     # ========================================================================
     # SECTION 1: NETWORK OVERVIEW
@@ -1594,6 +1611,115 @@ def main():
             st.graphviz_chart(flow_dot, use_container_width=True)
         else:
             st.caption("Not enough data to render the flow diagram.")
+
+    # ========================================================================
+    # TAB 2: OPTIMIZATION ENGINE
+    # ========================================================================
+    with tab_optimization:
+        # ========================================================================
+        # SECTION 4: REFERRAL OPTIMIZATION ENGINE
+        # ========================================================================
+        if opt_engine is not None:
+        st.markdown("""
+        <div class="section">
+            <div class="section-header">
+                <span class="section-num">4</span>
+                <span class="section-title">Referral Optimization Engine</span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Compute metrics
+        with st.spinner("Computing optimization metrics..."):
+            lag_metrics = opt_engine.compute_lag_metrics()
+            spikes = opt_engine.detect_spikes(lag_metrics)
+            pacing = opt_engine.compute_pacing()
+            scores = opt_engine.compute_optimization_scores(lag_metrics, pacing)
+
+        # Top metrics row
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            total_leads = len(events)
+            direct_leads = events['is_origin'].sum()
+            overall_rm = total_leads / direct_leads if direct_leads > 0 else 1.0
+            st.metric("Overall Referral Multiplier", f"{overall_rm:.2f}×")
+        with col2:
+            status_color = {"Healthy": "🟢", "Exceeding Capacity": "🔴", "Under-pacing": "🟡", "No Data": "⚪"}.get(pacing.status, "⚪")
+            st.metric("Current Pacing Factor", f"{status_color} {pacing.current_pacing_factor:.2f}")
+        with col3:
+            st.metric("Median Referral Lag", f"{lag_metrics.L_ref:.0f} days")
+
+        # Main charts
+        col1, col2 = st.columns([1, 1])
+
+        with col1:
+            st.markdown("**Pacing Curve**")
+            # Create pacing chart
+            daily_leads = events.groupby('lead_date').size().reset_index(name='leads')
+            daily_leads = daily_leads.sort_values('lead_date')
+            daily_leads['cumulative_actual'] = daily_leads['leads'].cumsum()
+            daily_leads['days'] = (daily_leads['lead_date'] - daily_leads['lead_date'].min()).dt.days
+            daily_target = pacing.cumulative_target / daily_leads['days'].max() if daily_leads['days'].max() > 0 else 0
+            daily_leads['cumulative_target'] = daily_leads['days'] * daily_target
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=daily_leads['lead_date'], y=daily_leads['cumulative_actual'], name='Actual', line=dict(color='blue')))
+            fig.add_trace(go.Scatter(x=daily_leads['lead_date'], y=daily_leads['cumulative_target'], name='Target', line=dict(color='red', dash='dash')))
+            fig.update_layout(title="Cumulative Leads vs Target", xaxis_title="Date", yaxis_title="Cumulative Leads", height=300)
+            st.plotly_chart(fig, use_container_width=True)
+
+        with col2:
+            st.markdown("**Lag Distribution**")
+            # Create lag histogram
+            referral_events = events[events['is_referral'].fillna(False)]
+            if not referral_events.empty:
+                lags = (referral_events['RefDate'] - referral_events['lead_date']).dt.days.dropna()
+                fig = px.histogram(lags, nbins=20, title="Referral Gestation Lag Distribution")
+                fig.update_layout(xaxis_title="Days", yaxis_title="Count", height=300)
+                fig.add_vline(x=lag_metrics.L_ref, line_dash="dash", line_color="red", annotation_text=f"Median: {lag_metrics.L_ref:.0f} days")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.caption("No referral data available for lag analysis")
+
+        # Optimization Leaderboard
+        st.markdown("**Optimization Leaderboard**")
+        if scores:
+            score_df = pd.DataFrame([{
+                'Payer': s.payer,
+                'Spend': f"${s.spend:,.0f}",
+                'Direct Leads': s.direct_leads,
+                'Referral Leads': s.referral_leads,
+                'RM': f"{s.rm:.2f}×",
+                'Eff. CPL': f"${s.eff_cpl:.2f}",
+                'Score': f"{s.total_score:.1f}"
+            } for s in scores])
+
+            st.dataframe(score_df, use_container_width=True, hide_index=True)
+
+            # Download manifest
+            manifest = opt_engine.get_manifest()
+            st.download_button(
+                "📄 Download Analysis Manifest",
+                manifest,
+                "optimization_manifest.json",
+                "application/json",
+                use_container_width=True
+            )
+        else:
+            st.caption("No optimization scores available")
+
+        # Spike History (if spikes detected)
+        if spikes:
+            st.markdown("**Recent Spike Events**")
+            spike_df = pd.DataFrame([{
+                'Date': s.date.strftime('%Y-%m-%d'),
+                'Lead Count': s.lead_count,
+                'Attribution': s.attribution,
+                'Confidence': f"{s.confidence:.1%}"
+            } for s in spikes])
+            st.dataframe(spike_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("💡 Upload Origin Performance and Media Raw data to access the Referral Optimization Engine")
 
 
 if __name__ == "__main__":
