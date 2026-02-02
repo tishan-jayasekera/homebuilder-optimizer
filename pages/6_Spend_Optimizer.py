@@ -102,6 +102,11 @@ with tab2:
     attr_df = attributor.compute_all_attributions()
 
     if not attr_df.empty:
+        if "Top_Indirect_Recipients" in attr_df.columns:
+            attr_df = attr_df.copy()
+            attr_df["Top_Indirect_Recipients"] = attr_df["Top_Indirect_Recipients"].apply(
+                lambda v: ", ".join([f"{k}: {val:.1f}" for k, val in v]) if isinstance(v, list) else str(v)
+            )
         st.dataframe(attr_df, use_container_width=True)
 
 with tab3:

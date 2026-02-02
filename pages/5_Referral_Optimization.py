@@ -416,6 +416,11 @@ with st.spinner("Computing network-wide attribution..."):
     attribution_df = attributor.compute_all_attributions()
 
 if not attribution_df.empty:
+    if "Top_Indirect_Recipients" in attribution_df.columns:
+        attribution_df = attribution_df.copy()
+        attribution_df["Top_Indirect_Recipients"] = attribution_df["Top_Indirect_Recipients"].apply(
+            lambda v: ", ".join([f"{k}: {val:.1f}" for k, val in v]) if isinstance(v, list) else str(v)
+        )
     # Show top performers by system efficiency
     st.markdown("**Top Payers by System-Level Efficiency**")
     display_attr = attribution_df.sort_values('System_CPR', ascending=True).head(15).copy()
