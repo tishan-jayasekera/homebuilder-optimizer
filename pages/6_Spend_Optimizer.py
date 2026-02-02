@@ -1,33 +1,25 @@
 """
 Advanced Spend Optimizer
-Full mathematical optimization interface with scenario planning.
+Traceable spend planning with fast heuristic allocation.
 """
 import sys
 from pathlib import Path
 import pandas as pd
-import numpy as np
-import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 
 ROOT = Path(__file__).parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.data_loader import load_events
-from src.normalization import normalize_events
-from src.attribution_engine import FullFunnelAttributor, PacingValidator
+from src.data_loader import load_events, load_media_raw
+from src.normalization import normalize_events, normalize_media_raw
+from src.attribution_engine import FullFunnelAttributor
 from src.optimization_engine import ReferralOptimizationEngine
-from src.mathematical_optimizer import (
-    MathematicalOptimizer,
-    OptimizationConfig,
-    quick_optimize
-)
 
 st.set_page_config(page_title="Spend Optimizer", page_icon="🧮", layout="wide")
 
 st.title("🧮 Advanced Spend Optimizer")
-st.markdown("Mathematical optimization for referral network spend allocation.")
+st.markdown("Traceable spend planning for referral network allocation.")
 
 # Check for data
 if 'events_file' not in st.session_state:
@@ -40,6 +32,12 @@ events_file = st.session_state['events_file']
 events_file.seek(0)
 events = load_events(events_file)
 events = normalize_events(events)
+media_raw = None
+if 'media_file' in st.session_state:
+    media_file = st.session_state['media_file']
+    media_file.seek(0)
+    media_raw = load_media_raw(media_file)
+    media_raw = normalize_media_raw(media_raw)
 
 # Sidebar configuration
 with st.sidebar:
@@ -63,83 +61,38 @@ with st.sidebar:
         min_value=0.2, max_value=0.8, value=0.4, step=0.05,
         help="No single source gets more than this share of budget")
 
-    use_job_targets = st.checkbox("Use Job Lead Targets", value=True,
-        help="Derive lead targets from LeadTarget_from_job / LeadTarget fields")
+    active_only = st.checkbox("Include Only Active Campaigns", value=True,
+        help="Uses effective_status from media data (defaults to Active)")
+
     lead_target_scale = st.slider("Lead Target Scale",
         min_value=0.5, max_value=2.0, value=1.0, step=0.05,
         help="Scale derived lead targets up/down")
-    total_lead_target_override = st.number_input("Total Lead Target Override",
-        min_value=0, max_value=1000000, value=0, step=100,
-        help="Optional override for total lead target (0 = use derived)")
 
     st.divider()
-    st.subheader("Quick Optimize Limits")
-    max_sources = st.slider("Max Sources", min_value=5, max_value=100, value=25, step=5)
-    max_builders = st.slider("Max Builders", min_value=5, max_value=100, value=25, step=5)
-    max_periods = st.slider("Max Periods (days)", min_value=7, max_value=90, value=30, step=7)
-    solver = st.selectbox("Solver", options=["ECOS", "SCS", "OSQP"], index=0)
+    st.subheader("Performance Guards")
+    max_builders_per_ad = st.slider("Max Builders per ad_key", min_value=25, max_value=300, value=200, step=25)
 
 # Main content
-tab1, tab2, tab3 = st.tabs(["🎯 Quick Optimize", "📊 Attribution Analysis", "📈 Scenario Planning"])
+tab1, tab2, tab3 = st.tabs(["⚡ Fast Optimizer", "📊 Attribution Analysis", "📈 Scenario Planning"])
 
 with tab1:
-    st.subheader("Quick Optimization")
-
-    if st.button("🚀 Run Quick Optimization", type="primary"):
-        with st.spinner("Running optimization..."):
-            result = quick_optimize(
-                events,
-                total_budget=total_budget,
-                horizon_days=horizon_days,
-                max_sources=max_sources,
-                max_builders=max_builders,
-                max_periods=max_periods,
-                solver=solver,
-                pacing_upper_bound=pacing_upper,
-                pacing_lower_bound=pacing_lower,
-                max_single_source_share=max_source_share,
-                total_lead_target=total_lead_target_override,
-                lead_target_scale=lead_target_scale,
-                use_job_targets=use_job_targets
-            )
-
-        if result.status.value == "optimal":
-            st.success("✅ Optimization successful!")
-
-            # Metrics row
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("System CPR", f"${result.system_cpr:,.2f}")
-            c2.metric("Total Referrals", f"{result.total_expected_referrals:,.0f}")
-            c3.metric("Target Referrals", f"{result.total_lead_target:,.0f}")
-            c4.metric("Solve Time", f"{result.solve_time_seconds:.2f}s")
-            st.caption(f"Budget Utilization: {result.budget_utilization:.0%} | Target Gap: {result.lead_target_gap:,.0f}")
-
-            # Allocation chart
-            if result.allocations:
-                alloc_data = pd.DataFrame([
-                    {"Source": a.source, "Amount": a.amount}
-                    for a in result.allocations
-                ]).groupby("Source").sum().reset_index()
-
-                fig = px.pie(alloc_data, values="Amount", names="Source",
-                            title="Spend Allocation by Source")
-                st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.error(f"Optimization failed: {result.solver_message}")
-
-    st.divider()
     st.subheader("Fast Optimizer (Traceable)")
 
-    if st.button("⚡ Run Fast Optimizer"):
+    if st.button("⚡ Run Fast Optimizer", type="primary"):
+        if active_only and media_raw is None:
+            st.warning("Active-only filter enabled but no media file uploaded. Proceeding without filter.")
         with st.spinner("Running fast optimizer..."):
-            engine = ReferralOptimizationEngine(events)
+            engine = ReferralOptimizationEngine(events, lite=True)
             fast_result = engine.fast_optimize_spend(
                 total_budget=total_budget,
                 horizon_days=horizon_days,
                 max_source_share=max_source_share,
                 pacing_upper=pacing_upper,
                 pacing_lower=pacing_lower,
-                lead_target_scale=lead_target_scale
+                lead_target_scale=lead_target_scale,
+                max_builders_per_ad=max_builders_per_ad,
+                media_raw_df=media_raw,
+                active_only=active_only
             )
 
         if fast_result.status == "ok":

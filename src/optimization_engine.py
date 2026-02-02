@@ -99,7 +99,7 @@ class ReferralOptimizationEngine:
     Core engine for computing referral network optimization metrics.
     """
 
-    def __init__(self, events_df: pd.DataFrame, origin_perf_df: Optional[pd.DataFrame] = None, media_raw_df: Optional[pd.DataFrame] = None):
+    def __init__(self, events_df: pd.DataFrame, origin_perf_df: Optional[pd.DataFrame] = None, media_raw_df: Optional[pd.DataFrame] = None, lite: bool = False):
         """
         Initialize with the three data sources.
 
@@ -116,25 +116,37 @@ class ReferralOptimizationEngine:
 
         # Preprocess data
         self._preprocess_data()
-        self._build_attribution()
+        if lite:
+            self._build_builder_targets()
+            self.attributor = None
+            self._attribution_helpers = {}
+            self.pacing_validator = None
+        else:
+            self._build_attribution()
 
-        # Initialize full funnel attribution
-        self.attributor = FullFunnelAttributor(self.events)
-        self._attribution_helpers = integrate_with_optimization_engine(self.attributor)
+            # Initialize full funnel attribution
+            self.attributor = FullFunnelAttributor(self.events)
+            self._attribution_helpers = integrate_with_optimization_engine(self.attributor)
 
-        # Initialize pacing validator
-        self.pacing_validator = PacingValidator(self.events)
+            # Initialize pacing validator
+            self.pacing_validator = PacingValidator(self.events)
 
     def compute_system_level_cpr(self, payer: str) -> float:
         """Get system-level CPR including all downstream network effects."""
+        if not self._attribution_helpers:
+            raise RuntimeError("Attribution engine not initialized (lite mode).")
         return self._attribution_helpers['compute_system_cpr'](payer)
 
     def get_full_attribution(self, payer: str):
         """Get complete attribution result for a payer."""
+        if self.attributor is None:
+            raise RuntimeError("Attribution engine not initialized (lite mode).")
         return self.attributor.attribute_spend(payer)
 
     def validate_builder_pacing(self, builder: str):
         """Validate pacing feasibility for a builder."""
+        if self.pacing_validator is None:
+            raise RuntimeError("Pacing validator not initialized (lite mode).")
         return self.pacing_validator.validate_builder(builder)
 
     def _preprocess_data(self):
@@ -327,7 +339,10 @@ class ReferralOptimizationEngine:
             return pd.DataFrame()
 
         rows = []
+        present_builders = set(events[dest_col].dropna().unique())
         for builder, daily_target in self.builder_targets.items():
+            if present_builders and builder not in present_builders:
+                continue
             if daily_target <= 0:
                 continue
             df = self.events[self.events[dest_col] == builder]
@@ -853,7 +868,9 @@ class ReferralOptimizationEngine:
         start_date: Optional[pd.Timestamp] = None,
         max_delivery_rows: int = 200000,
         max_schedule_rows: int = 50000,
-        max_builders_per_ad: int = 200
+        max_builders_per_ad: int = 200,
+        media_raw_df: Optional[pd.DataFrame] = None,
+        active_only: bool = True
     ) -> FastOptimizationResult:
         """
         Fast heuristic allocator for spend planning with traceability.
@@ -877,6 +894,31 @@ class ReferralOptimizationEngine:
         if start_date is None:
             start_date = pd.Timestamp.now().normalize()
         horizon_end = start_date + pd.Timedelta(days=horizon_days - 1)
+        notes = []
+
+        events = self.events.copy()
+        if active_only and media_raw_df is not None and not media_raw_df.empty:
+            media_ad_col = _find_col(media_raw_df.columns, ["ad_key", "Ad: Ad name", "AdKey", "campaign_key", "CampaignKey"])
+            status_col = _find_col(media_raw_df.columns, ["effective_status", "Effective_Status", "status", "Status"])
+            if media_ad_col and status_col:
+                s = media_raw_df[status_col].fillna("").astype(str).str.strip().str.lower()
+                active_mask = (s == "") | (s.str.contains("active") & ~s.str.contains("inactive") & ~s.str.contains("paused"))
+                active_ads = set(media_raw_df.loc[active_mask, media_ad_col].dropna().astype(str))
+                if active_ads:
+                    before = len(events)
+                    events = events[events[ad_col].astype(str).isin(active_ads)]
+                    notes.append(f"Filtered to active campaigns: {before} → {len(events)} events.")
+            else:
+                notes.append("Active-only filter skipped (missing effective_status/ad_key in media data).")
+        if events.empty:
+            return FastOptimizationResult(
+                status="error",
+                message="No events available after filtering campaigns.",
+                allocations=pd.DataFrame(),
+                expected_delivery=pd.DataFrame(),
+                leakage_summary=pd.DataFrame(),
+                trace={}
+            )
 
         # Builder targets and shortfall
         windows = self._builder_windows()
@@ -908,7 +950,7 @@ class ReferralOptimizationEngine:
         builder_targets_df = pd.DataFrame(builder_rows)
 
         # Ad performance
-        perf = self.events.groupby(ad_col).agg(
+        perf = events.groupby(ad_col).agg(
             total_spend=(cost_col, "sum"),
             total_leads=(ad_col, "size"),
         ).reset_index()
@@ -919,7 +961,7 @@ class ReferralOptimizationEngine:
 
         # Destination share per ad
         dest_counts = (
-            self.events.dropna(subset=[ad_col, dest_col])
+            events.dropna(subset=[ad_col, dest_col])
             .groupby([ad_col, dest_col])
             .size()
             .reset_index(name="lead_count")
@@ -996,7 +1038,6 @@ class ReferralOptimizationEngine:
         spend_schedule_rows = []
         expected_by_builder = {}
         max_lag_days = min(30, horizon_days)
-        notes = []
         if not allocations_df.empty:
             date_index = pd.date_range(start_date, horizon_end, freq="D")
             avg_dest_per_ad = (
