@@ -34,6 +34,19 @@ def patch_streamlit_width(st_module) -> None:
         _inner._codex_width_patched = True
         return _inner
 
-    for name in ("dataframe", "plotly_chart", "button"):
+    targets = ("dataframe", "plotly_chart", "button")
+
+    # Patch module-level functions
+    for name in targets:
         if hasattr(st_module, name):
             setattr(st_module, name, _wrap(getattr(st_module, name), name))
+
+    # Patch DeltaGenerator methods (covers st.sidebar, st.container, etc.)
+    try:
+        from streamlit.delta_generator import DeltaGenerator
+        for name in targets:
+            if hasattr(DeltaGenerator, name):
+                setattr(DeltaGenerator, name, _wrap(getattr(DeltaGenerator, name), name))
+    except Exception:
+        # Best-effort patching; ignore if internal API changes
+        pass
