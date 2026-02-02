@@ -654,7 +654,7 @@ def process_network(_events, start_date, end_date, excluded_builders):
 # ============================================================================
 # VISUALIZATION HELPERS
 # ============================================================================
-def render_network_graph(G, builder_master, focus=None, targets=None):
+def render_network_graph(G, builder_master, focus=None, targets=None, color_mode="Cluster", rm_map=None):
     edges = tuple(
         (u, v, float(data.get('weight', 1))) for u, v, data in G.edges(data=True)
     )
@@ -666,6 +666,7 @@ def render_network_graph(G, builder_master, focus=None, targets=None):
     if not builder_master.empty and 'BuilderRegionKey' in builder_master.columns and 'ClusterId' in builder_master.columns:
         cluster_map = builder_master.set_index('BuilderRegionKey')['ClusterId'].to_dict()
     colors = px.colors.qualitative.Set2
+    rm_map = rm_map or {}
     
     # Edges
     edge_x, edge_y = [], []
@@ -689,7 +690,15 @@ def render_network_graph(G, builder_master, focus=None, targets=None):
         deg = degrees.get(node, 0)
         size = 8 + (deg / max_deg) * 20
         cid = cluster_map.get(node, 0)
-        color = colors[cid % len(colors)]
+        if color_mode == "Network Leverage":
+            rm_val = rm_map.get(node, 1.0)
+            rm_norm = min(max((rm_val - 1.0) / 1.0, 0.0), 1.0)
+            scale = px.colors.sequential.RdYlGn
+            color = scale[int(rm_norm * (len(scale) - 1))]
+            hover = f"<b>{node}</b><br>RM: {rm_val:.2f}x"
+        else:
+            color = colors[cid % len(colors)]
+            hover = f"<b>{node}</b><br>Cluster {cid}"
         
         line_color, line_width = '#ffffff', 1
         if node == focus:
@@ -700,7 +709,7 @@ def render_network_graph(G, builder_master, focus=None, targets=None):
         fig.add_trace(go.Scatter(
             x=[x], y=[y], mode='markers',
             marker=dict(size=size, color=color, line=dict(color=line_color, width=line_width)),
-            text=f"<b>{node}</b><br>Cluster {cid}", hoverinfo='text', showlegend=False
+            text=hover, hoverinfo='text', showlegend=False
         ))
     
     fig.update_layout(
@@ -987,8 +996,24 @@ def main():
         
         if selected:
             st.session_state.focus_builder = selected
-        
-        fig = render_network_graph(G, bm, st.session_state.focus_builder, st.session_state.targets)
+
+        color_mode = st.radio(
+            "Node coloring",
+            ["Cluster", "Network Leverage"],
+            horizontal=True,
+            label_visibility="collapsed",
+        )
+        rm_map = {}
+        events_df = data["events"]
+        if "MediaPayer_BuilderRegionKey" in events_df.columns:
+            total = events_df.groupby("MediaPayer_BuilderRegionKey").size()
+            if "is_origin" in events_df.columns:
+                direct = events_df[events_df["is_origin"] == True].groupby("MediaPayer_BuilderRegionKey").size()
+            else:
+                direct = pd.Series(dtype=float)
+            rm_map = (total / direct.replace(0, np.nan)).fillna(1.0).to_dict()
+
+        fig = render_network_graph(G, bm, st.session_state.focus_builder, st.session_state.targets, color_mode=color_mode, rm_map=rm_map)
         st.plotly_chart(fig, width="stretch", config={'displayModeBar': False})
     
     with col2:
@@ -1604,6 +1629,52 @@ def main():
             st.graphviz_chart(flow_dot, width="stretch")
         else:
             st.caption("Not enough data to render the flow diagram.")
+
+    # ========================================================================
+    # SECTION 4: ECONOMIC PATH RECOMMENDATIONS
+    # ========================================================================
+    if not sf.empty and not data['leverage'].empty:
+        st.markdown("""
+        <div class="section">
+            <div class="section-header">
+                <span class="section-num">4</span>
+                <span class="section-title">Economic Path Recommendations</span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        leverage = data['leverage'].copy()
+        leverage = leverage.replace([np.inf, -np.inf], np.nan).dropna(subset=['eCPR'])
+
+        risk_targets = sf.sort_values("Risk_Score", ascending=False)["BuilderRegionKey"].dropna().unique().tolist()
+        if not risk_targets:
+            st.caption("No at-risk targets available for recommendations.")
+        else:
+            target = st.selectbox("Target builder (shortfall)", risk_targets, index=0)
+            target_rows = leverage[leverage['Dest_BuilderRegionKey'] == target].copy()
+            target_rows = target_rows.sort_values(['eCPR', 'Transfer_Rate'], ascending=[True, False]).head(10)
+
+            if target_rows.empty:
+                st.caption("No economic paths available for this target.")
+            else:
+                target_rows['Recommendation'] = target_rows.apply(
+                    lambda r: f"Shift budget to {r['MediaPayer_BuilderRegionKey']} (TR {r['Transfer_Rate']:.0%}, eCPR ${r['eCPR']:,.0f})",
+                    axis=1
+                )
+                st.dataframe(
+                    target_rows[[
+                        'MediaPayer_BuilderRegionKey',
+                        'Transfer_Rate',
+                        'eCPR',
+                        'Recommendation'
+                    ]].rename(columns={
+                        'MediaPayer_BuilderRegionKey': 'Payer',
+                        'Transfer_Rate': 'Transfer Rate',
+                        'eCPR': 'eCPR'
+                    }),
+                    hide_index=True,
+                    use_container_width=True
+                )
 
 
 if __name__ == "__main__":

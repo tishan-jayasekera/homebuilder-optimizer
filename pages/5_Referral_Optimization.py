@@ -80,12 +80,15 @@ def build_pacing_series(events: pd.DataFrame, target_leads_per_month: float) -> 
 def build_leaderboard(scores):
     rows = []
     for s in scores:
+        total_leads = s.direct_leads + s.referral_leads
+        cpl_net = s.spend / total_leads if total_leads > 0 else 0.0
         rows.append({
             "Payer": s.payer,
             "Spend": s.spend,
             "Direct Leads": int(s.direct_leads),
             "Referral Leads": int(s.referral_leads),
             "RM": s.rm,
+            "CPL_net": cpl_net,
             "Eff. CPL": s.eff_cpl,
             "Conv %": s.conversion,
             "Lag Score": s.lag_score,
@@ -129,11 +132,11 @@ with st.sidebar:
     )
 
     weights = {
-        "conversion": st.slider("Weight: Conversion", 0.0, 0.5, 0.2, 0.01),
-        "referral_multiplier": st.slider("Weight: Referral Multiplier", 0.0, 0.5, 0.25, 0.01),
-        "lag": st.slider("Weight: Lag", 0.0, 0.5, 0.15, 0.01),
-        "pacing": st.slider("Weight: Pacing", 0.0, 0.5, 0.15, 0.01),
-        "efficiency": st.slider("Weight: Efficiency", 0.0, 0.5, 0.25, 0.01),
+        "conversion": st.slider("Weight: Conversion", 0.0, 0.5, 0.15, 0.01),
+        "referral_multiplier": st.slider("Weight: Referral Multiplier", 0.0, 0.5, 0.35, 0.01),
+        "lag": st.slider("Weight: Lag", 0.0, 0.5, 0.2, 0.01),
+        "pacing": st.slider("Weight: Pacing", 0.0, 0.5, 0.1, 0.01),
+        "efficiency": st.slider("Weight: Efficiency", 0.0, 0.5, 0.2, 0.01),
     }
 
     weight_sum = sum(weights.values())
@@ -298,9 +301,12 @@ else:
     display = leaderboard.copy()
     display["Spend"] = display["Spend"].apply(format_currency)
     display["RM"] = display["RM"].apply(format_ratio)
+    display["CPL_net"] = display["CPL_net"].apply(format_currency)
     display["Eff. CPL"] = display["Eff. CPL"].apply(format_currency)
     display["Conv %"] = display["Conv %"].map(lambda v: f"{v:.1f}%")
     display["Score"] = display["Score"].map(lambda v: f"{v:.1f}")
+    net_gen = (leaderboard["RM"] >= 1.5) & (leaderboard["Lag Score"] >= 60)
+    display["Net Generator"] = net_gen.map(lambda v: "✅" if v else "—")
     st.dataframe(display, use_container_width=True, hide_index=True)
 
     selected_payer = st.selectbox(
@@ -365,6 +371,31 @@ else:
     } for s in spikes])
     st.dataframe(spike_df, hide_index=True, use_container_width=True)
 
+st.markdown('</div>', unsafe_allow_html=True)
+
+# Pacing actions
+st.markdown('<div class="section-card">', unsafe_allow_html=True)
+st.markdown("**Pacing-Aware Media Timing**")
+builder_pacing = engine.compute_builder_pacing()
+if builder_pacing.empty:
+    st.caption("No builder pacing targets available.")
+else:
+    near_cap = builder_pacing[builder_pacing["Pacing_Factor"] >= 1.15].copy()
+    under = builder_pacing[builder_pacing["Pacing_Factor"] < 0.8].copy()
+    if not near_cap.empty:
+        near_cap = near_cap.sort_values("Pacing_Factor", ascending=False)
+        near_cap["Action"] = "Soft Pause / Reduce Daily Budget"
+        st.markdown("**Builders Near Capacity**")
+        st.dataframe(near_cap[["Builder", "Pacing_Factor", "Action"]], hide_index=True, use_container_width=True)
+    if not under.empty:
+        under = under.sort_values("Pacing_Factor", ascending=True)
+        under["Action"] = "Increase Spend (fastest lag UTMs below)"
+        st.markdown("**Builders Under-Pacing**")
+        st.dataframe(under[["Builder", "Pacing_Factor", "Action"]], hide_index=True, use_container_width=True)
+        lag_by_ad = engine.compute_media_lag_by_ad_key(top_n=3)
+        if not lag_by_ad.empty:
+            st.caption("Top 3 ad_key by fastest media-to-lead lag")
+            st.dataframe(lag_by_ad, hide_index=True, use_container_width=True)
 st.markdown('</div>', unsafe_allow_html=True)
 
 # Manifest download

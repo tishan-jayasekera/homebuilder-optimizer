@@ -289,6 +289,40 @@ class ReferralOptimizationEngine:
         daily["lower_band"] = daily["cumulative_target"] * 0.8
         return daily
 
+    def compute_builder_pacing(self) -> pd.DataFrame:
+        """Compute pacing factor per destination builder using builder targets."""
+        dest_col = self.cols.get("dest_builder")
+        lead_date_col = self.cols.get("lead_date")
+        if not dest_col or not lead_date_col or not self.builder_targets:
+            return pd.DataFrame()
+
+        rows = []
+        for builder, daily_target in self.builder_targets.items():
+            if daily_target <= 0:
+                continue
+            df = self.events[self.events[dest_col] == builder]
+            if df.empty:
+                continue
+            daily = df.groupby(lead_date_col).size().reset_index(name="leads").sort_values(lead_date_col)
+            date_index = pd.date_range(daily[lead_date_col].min(), daily[lead_date_col].max(), freq="D")
+            daily = daily.set_index(lead_date_col).reindex(date_index, fill_value=0).rename_axis("lead_date").reset_index()
+            daily["cumulative_actual"] = daily["leads"].cumsum()
+            daily["cumulative_target"] = np.arange(1, len(daily) + 1) * daily_target
+            pacing_factor = daily["cumulative_actual"].iloc[-1] / max(daily["cumulative_target"].iloc[-1], 1)
+            if pacing_factor > 1.2:
+                status = "Exceeding Capacity"
+            elif pacing_factor < 0.8:
+                status = "Under-pacing"
+            else:
+                status = "Healthy"
+            rows.append({
+                "Builder": builder,
+                "Pacing_Factor": pacing_factor,
+                "Status": status,
+                "Daily_Target": daily_target,
+            })
+        return pd.DataFrame(rows)
+
     def compute_lag_metrics(self) -> LagMetrics:
         """
         Compute the three lag metrics: L_conv, L_ref, L_media.
@@ -389,6 +423,60 @@ class ReferralOptimizationEngine:
                 best_lag = lag
 
         return best_lag if abs(max_corr) > 0.3 else 0  # Only return lag if correlation is significant
+
+    def compute_media_lag_by_ad_key(self, top_n: int = 10) -> pd.DataFrame:
+        """Compute media-to-lead lag per ad_key for timing recommendations."""
+        date_col = _find_col(self.media_raw.columns, ['Date', 'date', 'SpendDate', 'spend_date'])
+        spend_col = _find_col(self.media_raw.columns, ['Amount_spent', 'amount_spent', 'Spend', 'spend', 'Cost'])
+        ad_col = _find_col(self.media_raw.columns, ['ad_key', 'AdKey', 'campaign_key', 'CampaignKey'])
+        lead_date_col = self.cols.get("lead_date")
+        event_ad_col = self.cols.get("ad_key")
+        is_origin_col = self.cols.get("is_origin")
+        if not date_col or not spend_col or not ad_col or not lead_date_col or not event_ad_col:
+            return pd.DataFrame()
+
+        results = []
+        for ad_key, spend_df in self.media_raw.groupby(ad_col):
+            leads_df = self.events[self.events[event_ad_col] == ad_key]
+            if is_origin_col and is_origin_col in leads_df.columns:
+                leads_df = leads_df[leads_df[is_origin_col] == True]
+            if spend_df.empty or leads_df.empty:
+                continue
+
+            daily_spend = spend_df.groupby(date_col)[spend_col].sum().reset_index()
+            daily_leads = leads_df.groupby(lead_date_col).size().reset_index(name='lead_count')
+            merged = pd.merge(daily_spend, daily_leads, left_on=date_col, right_on=lead_date_col, how='outer').fillna(0)
+
+            spend_series = merged[spend_col].values
+            lead_series = merged['lead_count'].values
+            if len(spend_series) < 5 or len(lead_series) < 5:
+                continue
+
+            max_corr = 0
+            best_lag = 0
+            for lag in range(-30, 31):
+                if lag < 0 and len(spend_series[:lag]) > 1:
+                    corr = np.corrcoef(spend_series[:lag], lead_series[-lag:])[0, 1]
+                elif lag > 0 and len(spend_series[lag:]) > 1:
+                    corr = np.corrcoef(spend_series[lag:], lead_series[:-lag])[0, 1]
+                elif lag == 0:
+                    corr = np.corrcoef(spend_series, lead_series)[0, 1]
+                else:
+                    continue
+                if not np.isnan(corr) and abs(corr) > abs(max_corr):
+                    max_corr = corr
+                    best_lag = lag
+
+            results.append({
+                "ad_key": ad_key,
+                "L_media": best_lag,
+                "corr": max_corr,
+            })
+
+        if not results:
+            return pd.DataFrame()
+        df = pd.DataFrame(results).sort_values("L_media", ascending=True)
+        return df.head(top_n)
 
     def detect_spikes(self, lag_metrics: LagMetrics) -> List[SpikeEvent]:
         """
@@ -657,7 +745,7 @@ class ReferralOptimizationEngine:
             efficiency = _score_inverse(eff_cpl, eff_p90)
 
             # Weighted total score
-            weights = [0.2, 0.25, 0.15, 0.15, 0.25]  # Conv, RM, Lag, Pace, Eff
+            weights = [0.15, 0.35, 0.2, 0.1, 0.2]  # Conv, RM, Lag, Pace, Eff
             total_score = (
                 weights[0] * conversion +
                 weights[1] * min(100, (rm / 1.5) * 100) +  # Scale RM to 0-100
@@ -707,11 +795,11 @@ class ReferralOptimizationEngine:
                 "correlation_significance_threshold": 0.3,
                 "lag_correlation_window_days": 30,
                 "optimization_score_weights": {
-                    "conversion": 0.2,
-                    "referral_multiplier": 0.25,
-                    "lag": 0.15,
-                    "pacing": 0.15,
-                    "efficiency": 0.25
+                    "conversion": 0.15,
+                    "referral_multiplier": 0.35,
+                    "lag": 0.2,
+                    "pacing": 0.1,
+                    "efficiency": 0.2
                 }
             },
             "data_summary": {
