@@ -41,7 +41,7 @@ class OptimizationConfig:
     pacing_lower_bound: float = 0.8  # At least 80% of target pace
     max_single_source_share: float = 0.4  # No source gets >40% of budget
     min_allocation: float = 100.0  # Minimum meaningful allocation
-    solver: str = "ECOS"  # ECOS, MOSEK, or SCS
+    solver: str = "SCS"  # ECOS, MOSEK, or SCS
     max_solve_time: float = 60.0  # seconds
     verbose: bool = False
 
@@ -353,16 +353,27 @@ class MathematicalOptimizer:
                 "SCS": cp.SCS,
                 "OSQP": cp.OSQP,
             }
-            solver = solver_map.get(config.solver, cp.ECOS)
-            
-            problem.solve(
-                solver=solver, 
-                verbose=config.verbose,
-                max_iters=10000
-            )
-            
+            solver = solver_map.get(config.solver, cp.SCS)
+
+            try:
+                problem.solve(
+                    solver=solver,
+                    verbose=config.verbose,
+                    max_iters=10000
+                )
+            except Exception as e:
+                # Fallback if requested solver isn't available
+                if "is not installed" in str(e).lower():
+                    problem.solve(
+                        solver=cp.SCS,
+                        verbose=config.verbose,
+                        max_iters=10000
+                    )
+                else:
+                    raise
+
             solve_time = time.time() - start_time
-            
+
         except Exception as e:
             return self._empty_result(f"Solver error: {str(e)}")
         
@@ -516,7 +527,7 @@ def quick_optimize(
     max_sources: int = 25,
     max_builders: int = 25,
     max_periods: int = 30,
-    solver: str = "ECOS"
+    solver: str = "SCS"
 ) -> OptimizationResult:
     """
     Quick optimization using defaults.
