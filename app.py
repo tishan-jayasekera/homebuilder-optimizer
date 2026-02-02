@@ -40,6 +40,8 @@ def get_available_pages():
                 pages['network'] = f"pages/{f.name}"
             elif 'postcode' in name_lower or 'suburb' in name_lower:
                 pages['postcode'] = f"pages/{f.name}"
+            elif 'optimization' in name_lower:
+                pages['optimization'] = f"pages/{f.name}"
     
     return pages
 
@@ -144,6 +146,23 @@ def main():
                 st.switch_page(pages['network'])
         else:
             st.error("Page not found: pages/3_Referral_Networks.py")
+
+    st.markdown("---")
+    col4, col5 = st.columns(2)
+
+    with col4:
+        st.markdown("#### 🧭 Referral Optimization")
+        st.markdown("""
+        Diagnose network dynamics:
+        - Lag & pacing insights
+        - Spike attribution
+        - Optimization scoring
+        """)
+        if 'optimization' in pages:
+            if st.button("🧭 Open Referral Optimization", key="btn_optimization", use_container_width=True):
+                st.switch_page(pages['optimization'])
+        else:
+            st.error("Page not found: pages/5_Referral_Optimization.py")
 
     col4, col5, col6 = st.columns(3)
     with col4:
