@@ -849,6 +849,16 @@ def main():
         st.warning("⚠️ Please upload Events data on the Home page.")
         st.page_link("app.py", label="← Go to Home", icon="🏠")
         return
+
+    view = st.radio(
+        "View",
+        ["Referral Networks", "Referral Optimization"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    if view == "Referral Optimization":
+        st.switch_page("pages/5_Referral_Optimization.py")
+        return
     
     # Sidebar
     with st.sidebar:

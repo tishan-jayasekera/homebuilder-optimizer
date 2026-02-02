@@ -114,12 +114,18 @@ with st.sidebar:
     st.header("Inputs")
     st.caption("Upload on the Home page. This engine uses Events, Origin Perf, and Media Raw.")
 
+    use_builder_targets = st.checkbox(
+        "Use builder-specific targets from Events (LeadTarget_from_job)",
+        value=True,
+        help="Uses LeadTarget_from_job with WIP_JOB_LIVE_START/END for pacing targets."
+    )
     target_leads = st.number_input(
         "Target leads / month",
         min_value=10,
         max_value=100000,
         value=100,
         step=10,
+        disabled=use_builder_targets,
     )
 
     weights = {
@@ -151,7 +157,10 @@ events, origin_perf, media_raw = inputs
 
 engine = ReferralOptimizationEngine(events, origin_perf, media_raw)
 lag_metrics = engine.compute_lag_metrics()
-pacing_metrics = engine.compute_pacing(target_leads_per_month=target_leads)
+pacing_metrics = engine.compute_pacing(
+    target_leads_per_month=None if use_builder_targets else target_leads,
+    use_builder_targets=use_builder_targets,
+)
 spikes = engine.detect_spikes(lag_metrics)
 
 scores = engine.compute_optimization_scores(lag_metrics, pacing_metrics)
@@ -204,7 +213,10 @@ chart_cols = st.columns(2)
 with chart_cols[0]:
     st.markdown('<div class="section-card">', unsafe_allow_html=True)
     st.markdown("**Pacing Curve (Cumulative Actual vs Target)**")
-    pacing_series = build_pacing_series(events, target_leads)
+    pacing_series = engine.compute_pacing_series(
+        target_leads_per_month=None if use_builder_targets else target_leads,
+        use_builder_targets=use_builder_targets,
+    )
     if pacing_series.empty:
         st.caption("Not enough data to render pacing curve.")
     else:
@@ -244,13 +256,32 @@ with chart_cols[0]:
 with chart_cols[1]:
     st.markdown('<div class="section-card">', unsafe_allow_html=True)
     st.markdown("**Referral Lag Distribution (days)**")
-    if "is_referral" in events.columns and "RefDate" in events.columns:
-        ref_df = events[events['is_referral'].fillna(False) & events['RefDate'].notna()].copy()
+    lead_id_col = "LeadId" if "LeadId" in events.columns else None
+    parent_id_col = None
+    for cand in ["ParentLeadId", "Parent_LeadId", "ParentLeadID", "ReferrerLeadId", "Referrer_LeadId", "RefLeadId", "ParentLead", "ReferrerLead"]:
+        if cand in events.columns:
+            parent_id_col = cand
+            break
+    if lead_id_col and parent_id_col and "lead_date" in events.columns:
+        parent_dates = events[[lead_id_col, "lead_date"]].dropna().rename(
+            columns={lead_id_col: "parent_id", "lead_date": "parent_lead_date"}
+        )
+        child = events[[parent_id_col, "lead_date"]].dropna()
+        merged = child.merge(parent_dates, left_on=parent_id_col, right_on="parent_id", how="inner")
+        if merged.empty:
+            st.caption("No referral lag data available.")
+        else:
+            merged["lag_days"] = (merged["lead_date"] - merged["parent_lead_date"]).dt.days
+            fig = px.histogram(merged, x="lag_days", nbins=25, color_discrete_sequence=["#22c55e"])
+            fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), xaxis_title="Days", yaxis_title="Referrals")
+            st.plotly_chart(fig, use_container_width=True)
+    elif "is_referral" in events.columns and "RefDate" in events.columns:
+        ref_df = events[events["is_referral"].fillna(False) & events["RefDate"].notna()].copy()
         if ref_df.empty:
             st.caption("No referral lag data available.")
         else:
-            ref_df['lag_days'] = (ref_df['RefDate'] - ref_df['lead_date']).dt.days
-            fig = px.histogram(ref_df, x='lag_days', nbins=25, color_discrete_sequence=['#22c55e'])
+            ref_df["lag_days"] = (ref_df["RefDate"] - ref_df["lead_date"]).dt.days
+            fig = px.histogram(ref_df, x="lag_days", nbins=25, color_discrete_sequence=["#22c55e"])
             fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), xaxis_title="Days", yaxis_title="Referrals")
             st.plotly_chart(fig, use_container_width=True)
     else:
@@ -278,7 +309,10 @@ else:
         index=0,
     )
 
-    payer_events = events[events['MediaPayer_BuilderRegionKey'] == selected_payer]
+    payer_col = "_attributed_payer" if "_attributed_payer" in events.columns else (
+        "MediaPayer_BuilderRegionKey" if "MediaPayer_BuilderRegionKey" in events.columns else None
+    )
+    payer_events = events[events[payer_col] == selected_payer] if payer_col else pd.DataFrame()
     if payer_events.empty:
         st.caption("No events found for this payer.")
     else:
@@ -336,6 +370,8 @@ st.markdown('</div>', unsafe_allow_html=True)
 # Manifest download
 manifest = json.loads(engine.get_manifest())
 manifest["parameters"]["optimization_score_weights"] = weights
+manifest["parameters"]["use_builder_targets"] = use_builder_targets
+manifest["parameters"]["target_leads_per_month"] = None if use_builder_targets else target_leads
 manifest_bytes = json.dumps(manifest, indent=2).encode("utf-8")
 
 st.download_button(
