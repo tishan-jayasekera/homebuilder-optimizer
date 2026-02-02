@@ -15,8 +15,6 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from src.streamlit_compat import patch_streamlit_width
-patch_streamlit_width(st)
 from plotly.subplots import make_subplots
 
 # Project imports
@@ -1171,23 +1169,23 @@ def main():
         
         with c1:
             st.markdown("**P&L Waterfall (Revenue → Media → Profit)**")
-            st.plotly_chart(fig_pnl_waterfall(m), width='stretch')
+            st.plotly_chart(fig_pnl_waterfall(m), use_container_width=True)
             
             figc, pct80 = fig_concentration_pareto(pnl_snapshot)
             if figc is not None:
                 st.markdown("**Concentration (Pareto)**")
-                st.plotly_chart(figc, width='stretch')
+                st.plotly_chart(figc, use_container_width=True)
                 st.caption(f"~{pct80:.0f}% of builders generate 80% of profit.")
         
         with c2:
             st.markdown("**Profit composition (Top performers vs drag)**")
-            st.plotly_chart(fig_profit_bridge_by_segment(pnl_snapshot), width='stretch')
+            st.plotly_chart(fig_profit_bridge_by_segment(pnl_snapshot), use_container_width=True)
             
             if pnl_ts is not None and not pnl_ts.empty and "period_start" in pnl_ts.columns:
                 st.markdown("**Trajectory (portfolio)**")
                 figt = fig_trajectory(pnl_ts, freq=freq)
                 if figt:
-                    st.plotly_chart(figt, width='stretch')
+                    st.plotly_chart(figt, use_container_width=True)
                 else:
                     st.info("Trajectory not available.")
         
@@ -1212,7 +1210,7 @@ def main():
             unsafe_allow_html=True,
         )
         
-        st.plotly_chart(fig_top_bottom_contributors(pnl_snapshot, n=12), width='stretch')
+        st.plotly_chart(fig_top_bottom_contributors(pnl_snapshot, n=12), use_container_width=True)
         
         losses = pnl_snapshot[pnl_snapshot["Profit"] < 0].sort_values("Profit").copy()
         
@@ -1238,7 +1236,6 @@ def main():
                     "Margin": "{:.1%}",
                 }),
                 hide_index=True,
-                width='stretch',
                 height=420,
             )
         else:
@@ -1263,7 +1260,7 @@ def main():
             
             with c1:
                 st.markdown("**Builder action map (ROAS × Margin)**")
-                st.plotly_chart(fig_scatter, width='stretch')
+                st.plotly_chart(fig_scatter, use_container_width=True)
                 st.caption("Bubble size = media spend. Quadrants imply default action.")
             
             with c2:
@@ -1272,7 +1269,7 @@ def main():
                 s["Revenue"] = s["Revenue"].map(fmt_currency)
                 s["MediaCost"] = s["MediaCost"].map(fmt_currency)
                 s["Profit"] = s["Profit"].map(fmt_currency)
-                st.dataframe(s, hide_index=True, width='stretch', height=220)
+                st.dataframe(s, hide_index=True, use_container_width=True, height=220)
                 
                 # Scenario
                 scen = reallocation_scenario(df_actions, move_share)
@@ -1311,7 +1308,6 @@ def main():
                     "PriorityScore": "{:,.0f}",
                 }),
                 hide_index=True,
-                width='stretch',
                 height=520,
             )
     
@@ -1391,7 +1387,6 @@ def main():
                     "Margin": "{:.1%}",
                 }),
                 hide_index=True,
-                width='stretch',
                 height=460,
             )
             
@@ -1479,7 +1474,7 @@ def main():
                     fig.update_xaxes(gridcolor=GRID)
                     
                     st.markdown("**Builder trajectory**")
-                    st.plotly_chart(fig, width='stretch')
+                    st.plotly_chart(fig, use_container_width=True)
     
     # -------------------------------------------------------------------------
     # TAB 05: Data
@@ -1548,7 +1543,6 @@ def main():
         st.dataframe(
             table.style.format(fmt),
             hide_index=True,
-            width='stretch',
             height=560,
         )
         

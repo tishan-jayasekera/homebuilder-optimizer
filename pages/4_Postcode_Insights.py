@@ -3,8 +3,6 @@ Postcode Opportunity Insights
 Understand referral rates and campaign density by postcode/suburb.
 """
 import streamlit as st
-from src.streamlit_compat import patch_streamlit_width
-patch_streamlit_width(st)
 import pandas as pd
 import numpy as np
 import re
@@ -505,8 +503,7 @@ def main():
                         st.markdown("**Builder coverage summary**")
                         st.dataframe(
                             builder_summary.rename(columns={"Dest_BuilderRegionKey": "Builder"}),
-                            hide_index=True,
-                            width='stretch'
+                            hide_index=True
                         )
                 else:
                     map_df = postcode_rollup.copy()
@@ -716,7 +713,6 @@ def main():
                         fig_builders.update_layout(margin=dict(l=0, r=0, t=40, b=0))
                         st.plotly_chart(
                             fig_builders,
-                            width='stretch',
                             config={"displayModeBar": True, "scrollZoom": True}
                         )
                     with c2:
@@ -742,7 +738,6 @@ def main():
                         fig_overlap.update_layout(margin=dict(l=0, r=0, t=40, b=0))
                         st.plotly_chart(
                             fig_overlap,
-                            width='stretch',
                             config={"displayModeBar": True, "scrollZoom": True}
                         )
                     overlap_hotspots = map_df[map_df["Builder_Count"] >= 2].copy()
@@ -750,8 +745,7 @@ def main():
                         st.markdown("**Overlap hotspots (multiple builders in same postcode)**")
                         st.dataframe(
                             overlap_hotspots[["Postcode", "Builder_Count", "Leads", "Referrals"]].head(25),
-                            hide_index=True,
-                            width='stretch'
+                            hide_index=True
                         )
                 else:
                     hover_cols = {c: True for c in ["Leads", "Referrals", "Campaigns"] if c in map_df.columns}
@@ -776,7 +770,6 @@ def main():
                 )
                 st.plotly_chart(
                     fig,
-                    width='stretch',
                     config={"displayModeBar": True, "scrollZoom": True}
                 )
         else:
@@ -816,7 +809,7 @@ def main():
         title="Top opportunity postcodes (low referral rate + high campaign density)"
         )
         fig2.update_layout(height=360, margin=dict(l=0, r=0, t=40, b=0))
-        st.plotly_chart(fig2, width='stretch', config={"displayModeBar": False})
+        st.plotly_chart(fig2, use_container_width=True, config={"displayModeBar": False})
 
         display = group.rename(columns={
             postcode_col: "Postcode",
@@ -828,8 +821,7 @@ def main():
         st.dataframe(
             display[["Postcode", "Suburb", "Leads", "Referrals", "Total_Events", "Referral Rate", "Campaigns", "Ad Spend", "CPR", "Opportunity Score"]]
             .head(50),
-            hide_index=True,
-            width='stretch'
+            hide_index=True
         )
 
         if not group.empty:
@@ -839,7 +831,7 @@ def main():
                 .sort_values(["Postcode", "Suburb"])
                 .head(200)
             )
-            st.dataframe(suburb_list, hide_index=True, width='stretch')
+            st.dataframe(suburb_list, hide_index=True, use_container_width=True)
 
     with tabs[2]:
         st.markdown("""
@@ -1181,7 +1173,7 @@ def main():
                     xaxis_title=None,
                     title="Pace build-up"
                 )
-                st.plotly_chart(pace_fig, width='stretch', config={"displayModeBar": False})
+                st.plotly_chart(pace_fig, use_container_width=True, config={"displayModeBar": False})
             with pace_cols[1]:
                 st.markdown("**Horizon impact on capacity**")
                 if pace_14 <= 0:
@@ -1201,8 +1193,8 @@ def main():
                         name="Pace capacity"
                     ))
                     horizon_fig.update_layout(height=240, margin=dict(l=0, r=0, t=40, b=0), yaxis_title="Events", title="Capacity grows with the forecast horizon")
-                    st.plotly_chart(horizon_fig, width='stretch', config={"displayModeBar": False})
-                    st.dataframe(horizon_table, hide_index=True, width='stretch')
+                    st.plotly_chart(horizon_fig, use_container_width=True, config={"displayModeBar": False})
+                    st.dataframe(horizon_table, hide_index=True, use_container_width=True)
 
             st.markdown("**2) Cost trend (CPR)**")
             if not ts.empty and (ts["CPL"].notna().any() or ts["CPR"].notna().any()):
@@ -1251,7 +1243,7 @@ def main():
                         opacity=0.2
                     ))
                 fig_ts.update_layout(height=280, margin=dict(l=0, r=0, t=40, b=0), yaxis_title="Cost")
-                st.plotly_chart(fig_ts, width='stretch', config={"displayModeBar": False})
+                st.plotly_chart(fig_ts, use_container_width=True, config={"displayModeBar": False})
             else:
                 st.caption("Not enough spend/event data to plot CPR trends for this selection.")
 
@@ -1265,7 +1257,7 @@ def main():
                     name="Events per day"
                 ))
                 pace_fig.update_layout(height=220, margin=dict(l=0, r=0, t=40, b=0), yaxis_title="Events / day", title="Recent delivery pace")
-                st.plotly_chart(pace_fig, width='stretch', config={"displayModeBar": False})
+                st.plotly_chart(pace_fig, use_container_width=True, config={"displayModeBar": False})
             else:
                 st.caption("No recent activity to show pace.")
 
@@ -1274,7 +1266,7 @@ def main():
                 {"Scenario": "Planned", "Spend": planned_spend, "Capacity (Spend)": capacity_spend, "Recommended Cap": capacity, "Binding": binding},
                 {"Scenario": "Stretch", "Spend": boost_spend, "Capacity (Spend)": boost_capacity_spend, "Recommended Cap": boost_capacity, "Binding": binding}
             ])
-            st.dataframe(scenario, hide_index=True, width='stretch')
+            st.dataframe(scenario, hide_index=True, use_container_width=True)
 
             sensitivity_df = pd.DataFrame([
                 {
@@ -1356,8 +1348,7 @@ def main():
                 else:
                     st.dataframe(
                         camp.rename(columns={campaign_col: "Campaign"}),
-                        hide_index=True,
-                        width='stretch'
+                        hide_index=True
                     )
 
                     total_refs = camp["Referrals"].sum()
@@ -1394,10 +1385,10 @@ def main():
                         comp_rows.append(row)
                     if comp_rows:
                         st.markdown("**Campaign composition snapshot**")
-                        st.dataframe(pd.DataFrame(comp_rows), hide_index=True, width='stretch')
+                        st.dataframe(pd.DataFrame(comp_rows), hide_index=True, use_container_width=True)
 
             st.markdown("**Sensitivity & assumptions**")
-            st.dataframe(sensitivity_df, hide_index=True, width='stretch')
+            st.dataframe(sensitivity_df, hide_index=True, use_container_width=True)
             st.caption(sensitivity_note)
 
     with tabs[3]:
@@ -1444,8 +1435,7 @@ def main():
                 state_benchmark.rename(columns={
                     "Avg_CPR": "Avg CPR"
                 }),
-                hide_index=True,
-                width='stretch'
+                hide_index=True
             )
 
             st.markdown("**Regional composition by state**")
@@ -1568,7 +1558,7 @@ def main():
                             st.markdown(f"<div class='insight'><div class='insight-text'>{insight}</div></div>", unsafe_allow_html=True)
                         fig = state_stack_chart(finance_share, "Finance Status", palette)
                         if fig:
-                            st.plotly_chart(fig, width='stretch', config={"displayModeBar": False})
+                            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
                     else:
                         st.caption("Finance Status data not available.")
                 with comp_tabs[1]:
@@ -1579,7 +1569,7 @@ def main():
                             st.markdown(f"<div class='insight'><div class='insight-text'>{insight}</div></div>", unsafe_allow_html=True)
                         fig = state_stack_chart(timeframe_share, "Timeframe", palette)
                         if fig:
-                            st.plotly_chart(fig, width='stretch', config={"displayModeBar": False})
+                            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
                     else:
                         st.caption("Timeframe data not available.")
                 with comp_tabs[2]:
@@ -1590,7 +1580,7 @@ def main():
                             st.markdown(f"<div class='insight'><div class='insight-text'>{insight}</div></div>", unsafe_allow_html=True)
                         fig = state_stack_chart(land_share, "Do you have land", palette)
                         if fig:
-                            st.plotly_chart(fig, width='stretch', config={"displayModeBar": False})
+                            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
                     else:
                         st.caption("Land status data not available.")
                 with comp_tabs[3]:
@@ -1601,7 +1591,7 @@ def main():
                             st.markdown(f"<div class='insight'><div class='insight-text'>{insight}</div></div>", unsafe_allow_html=True)
                         fig = state_stack_chart(house_share, "House type", palette)
                         if fig:
-                            st.plotly_chart(fig, width='stretch', config={"displayModeBar": False})
+                            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
                     else:
                         st.caption("House type data not available.")
                 with comp_tabs[4]:
@@ -1612,7 +1602,7 @@ def main():
                             st.markdown(f"<div class='insight'><div class='insight-text'>{insight}</div></div>", unsafe_allow_html=True)
                         fig = state_stack_chart(beds_share, "Bedrooms", palette)
                         if fig:
-                            st.plotly_chart(fig, width='stretch', config={"displayModeBar": False})
+                            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
                     else:
                         st.caption("Bedrooms data not available.")
                 with comp_tabs[5]:
@@ -1643,7 +1633,7 @@ def main():
                                         palette
                                     )
                                     if fig:
-                                        st.plotly_chart(fig, width='stretch', config={"displayModeBar": False})
+                                        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
                                 with right:
                                     fig_box = px.box(
                                         budget_valid,
@@ -1659,7 +1649,7 @@ def main():
                                         xaxis_title=None,
                                         yaxis_title="Budget"
                                     )
-                                    st.plotly_chart(fig_box, width='stretch', config={"displayModeBar": False})
+                                    st.plotly_chart(fig_box, use_container_width=True, config={"displayModeBar": False})
                     else:
                         st.caption("Budget data not available.")
 
@@ -1676,8 +1666,7 @@ def main():
             st.markdown("**Underperforming high-volume postcodes**")
             st.dataframe(
                 outliers[["Postcode", "Suburb", "Leads", "Referral_Rate", "CPR", "Campaigns"]].head(20),
-                hide_index=True,
-                width='stretch'
+                hide_index=True
             )
 
     with tabs[4]:
@@ -1757,8 +1746,7 @@ def main():
                     "Avg_Conversion": "Avg Referral Rate",
                     "Avg_CPR": "Avg CPR"
                 }),
-                hide_index=True,
-                width='stretch'
+                hide_index=True
             )
 
             st.markdown("**Priority actions by postcode**")
@@ -1774,8 +1762,7 @@ def main():
                     "Postcode", "Suburb", "Leads", "Referrals", "Total_Events", "Referral Rate",
                     "Campaigns", "Ad Spend", "CPR", "Zone", "Recommended Action"
                 ]].head(50),
-                hide_index=True,
-                width='stretch'
+                hide_index=True
             )
 
     with tabs[5]:
@@ -1806,8 +1793,7 @@ def main():
             st.markdown("**Most crowded postcodes**")
             st.dataframe(
                 crowded[["Postcode", "Suburb", "Leads", "Campaigns", "Campaigns_per_Lead", "Referral_Rate"]],
-                hide_index=True,
-                width='stretch'
+                hide_index=True
             )
 
             if "LeadId" in df.columns:
@@ -1829,7 +1815,7 @@ def main():
                 campaign_col: "Campaign"
             })
             st.markdown("**Top campaigns in high-overlap areas**")
-            st.dataframe(campaign_list, hide_index=True, width='stretch')
+            st.dataframe(campaign_list, hide_index=True, use_container_width=True)
 
     with tabs[6]:
         st.markdown("""
@@ -1890,7 +1876,7 @@ def main():
                 line=dict(color="#6366f1")
             ))
             spend_fig.update_layout(height=220, margin=dict(l=0, r=0, t=40, b=0), yaxis_title="Spend", title="Spend trend")
-            st.plotly_chart(spend_fig, width='stretch', config={"displayModeBar": False})
+            st.plotly_chart(spend_fig, use_container_width=True, config={"displayModeBar": False})
 
             volume_fig = go.Figure()
             volume_fig.add_trace(go.Bar(
@@ -1912,7 +1898,7 @@ def main():
                 yaxis_title="Events",
                 title="Lead → Referral volume"
             )
-            st.plotly_chart(volume_fig, width='stretch', config={"displayModeBar": False})
+            st.plotly_chart(volume_fig, use_container_width=True, config={"displayModeBar": False})
 
             efficiency_fig = go.Figure()
             efficiency_fig.add_trace(go.Scatter(
@@ -1935,7 +1921,7 @@ def main():
                     yaxis2=dict(overlaying="y", side="right", title="Revenue / Event")
                 )
             efficiency_fig.update_layout(height=240, margin=dict(l=0, r=0, t=40, b=0), yaxis_title="CPR", title="Efficiency (CPR + Revenue / Event)")
-            st.plotly_chart(efficiency_fig, width='stretch', config={"displayModeBar": False})
+            st.plotly_chart(efficiency_fig, use_container_width=True, config={"displayModeBar": False})
 
             st.markdown("**Funnel summary (current window)**")
             total_spend = ts_campaign["Spend"].sum()
@@ -1954,7 +1940,7 @@ def main():
                 color_discrete_sequence=["#6366f1", "#22c55e", "#14b8a6", "#f59e0b"]
             )
             funnel_fig.update_layout(height=260, margin=dict(l=0, r=0, t=30, b=0), yaxis_title=None)
-            st.plotly_chart(funnel_fig, width='stretch', config={"displayModeBar": False})
+            st.plotly_chart(funnel_fig, use_container_width=True, config={"displayModeBar": False})
 
             st.markdown("**Time to first lead by campaign**")
             lag_basis = st.radio(
@@ -1994,7 +1980,7 @@ def main():
                 color_discrete_map={"On-time": "#22c55e", "At risk": "#ef4444"}
             )
             lag_fig.update_layout(height=260, margin=dict(l=0, r=0, t=30, b=0), xaxis_title="Days to first lead", yaxis_title="Campaigns")
-            st.plotly_chart(lag_fig, width='stretch', config={"displayModeBar": False})
+            st.plotly_chart(lag_fig, use_container_width=True, config={"displayModeBar": False})
 
             st.markdown("**Campaign performance (current window)**")
             camp_perf = (
@@ -2020,8 +2006,7 @@ def main():
             camp_perf = camp_perf.merge(campaign_first[[campaign_col, "Days_to_First_Lead", "Status"]], on=campaign_col, how="left")
             st.dataframe(
                 camp_perf.sort_values(["Status", "CPR"], ascending=[True, True]).rename(columns={campaign_col: "Campaign"}),
-                hide_index=True,
-                width='stretch'
+                hide_index=True
             )
 
             st.markdown("**Single campaign view**")
@@ -2077,7 +2062,7 @@ def main():
                 c_spend = go.Figure()
                 c_spend.add_trace(go.Scatter(x=c_ts["period"], y=c_ts["Spend"], name="Spend", mode="lines+markers", line=dict(color="#6366f1")))
                 c_spend.update_layout(height=200, margin=dict(l=0, r=0, t=30, b=0), yaxis_title="Spend", title="Campaign spend trend")
-                st.plotly_chart(c_spend, width='stretch', config={"displayModeBar": False})
+                st.plotly_chart(c_spend, use_container_width=True, config={"displayModeBar": False})
 
                 c_eff = go.Figure()
                 c_eff.add_trace(go.Scatter(
@@ -2116,7 +2101,7 @@ def main():
                         line=dict(color="#f59e0b", dash="dot")
                     ))
                 c_eff.update_layout(height=200, margin=dict(l=0, r=0, t=30, b=0), yaxis_title="Value", title="Campaign efficiency trend")
-                st.plotly_chart(c_eff, width='stretch', config={"displayModeBar": False})
+                st.plotly_chart(c_eff, use_container_width=True, config={"displayModeBar": False})
 
             st.markdown("**Campaigns at risk (slow to first lead)**")
             st.dataframe(
@@ -2124,8 +2109,7 @@ def main():
                 .sort_values("Days_to_First_Lead", ascending=False)
                 .head(20)
                 .rename(columns={campaign_col: "Campaign"}),
-                hide_index=True,
-                width='stretch'
+                hide_index=True
             )
 
     st.markdown("""

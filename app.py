@@ -3,8 +3,6 @@ IBN HS Analytics - Main Entry Point
 Builder Economics & Referral Network Analysis Platform
 """
 import streamlit as st
-from src.streamlit_compat import patch_streamlit_width
-patch_streamlit_width(st)
 from pathlib import Path
 
 st.set_page_config(
@@ -118,7 +116,7 @@ def main():
         - **Origin**: Original lead source
         """)
         if 'pnl' in pages:
-            if st.button("📊 Open Builder P&L", key="btn_pnl", width='stretch'):
+            if st.button("📊 Open Builder P&L", key="btn_pnl"):
                 st.switch_page(pages['pnl'])
         else:
             st.error("Page not found: pages/1_Builder_PnL.py")
@@ -132,7 +130,7 @@ def main():
         - Active vs Paused analysis
         """)
         if 'orphan' in pages:
-            if st.button("🎯 Open Orphan Media", key="btn_orphan", width='stretch'):
+            if st.button("🎯 Open Orphan Media", key="btn_orphan"):
                 st.switch_page(pages['orphan'])
         else:
             st.error("Page not found: pages/2_Orphan_Media.py")
@@ -146,7 +144,7 @@ def main():
         - Media efficiency pathfinding
         """)
         if 'network' in pages:
-            if st.button("🔗 Open Referral Networks", key="btn_network", width='stretch'):
+            if st.button("🔗 Open Referral Networks", key="btn_network"):
                 st.switch_page(pages['network'])
         else:
             st.error("Page not found: pages/3_Referral_Networks.py")
@@ -163,7 +161,7 @@ def main():
         - Optimization scoring
         """)
         if 'optimization' in pages:
-            if st.button("🧭 Open Referral Optimization", key="btn_optimization", width='stretch'):
+            if st.button("🧭 Open Referral Optimization", key="btn_optimization"):
                 st.switch_page(pages['optimization'])
         else:
             st.error("Page not found: pages/5_Referral_Optimization.py")
@@ -177,7 +175,7 @@ def main():
         - Scenario planning
         """)
         if 'optimizer' in pages:
-            if st.button("🧮 Open Spend Optimizer", key="btn_optimizer", width='stretch'):
+            if st.button("🧮 Open Spend Optimizer", key="btn_optimizer"):
                 st.switch_page(pages['optimizer'])
         else:
             st.error("Page not found: pages/6_Spend_Optimizer.py")
@@ -192,7 +190,7 @@ def main():
         - Opportunity targeting guidance
         """)
         if 'postcode' in pages:
-            if st.button("📍 Open Postcode Insights", key="btn_postcode", width='stretch'):
+            if st.button("📍 Open Postcode Insights", key="btn_postcode"):
                 st.switch_page(pages['postcode'])
         else:
             st.error("Page not found: pages/4_Postcode_Insights.py")

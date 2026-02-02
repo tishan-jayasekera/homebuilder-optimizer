@@ -9,8 +9,6 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from src.streamlit_compat import patch_streamlit_width
-patch_streamlit_width(st)
 
 ROOT = Path(__file__).parent.parent
 if str(ROOT) not in sys.path:
@@ -108,7 +106,7 @@ with tab1:
 
                 fig = px.pie(alloc_data, values="Amount", names="Source",
                             title="Spend Allocation by Source")
-                st.plotly_chart(fig, width='stretch')
+                st.plotly_chart(fig, use_container_width=True)
         else:
             st.error(f"Optimization failed: {result.solver_message}")
 
@@ -124,7 +122,7 @@ with tab2:
             attr_df["Top_Indirect_Recipients"] = attr_df["Top_Indirect_Recipients"].apply(
                 lambda v: ", ".join([f"{k}: {val:.1f}" for k, val in v]) if isinstance(v, list) else str(v)
             )
-        st.dataframe(attr_df, width='stretch')
+        st.dataframe(attr_df, use_container_width=True)
 
 with tab3:
     st.subheader("Scenario Planning")

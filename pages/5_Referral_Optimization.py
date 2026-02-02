@@ -10,8 +10,6 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from src.streamlit_compat import patch_streamlit_width
-patch_streamlit_width(st)
 import subprocess
 
 ROOT = Path(__file__).parent.parent
@@ -267,7 +265,7 @@ with chart_cols[0]:
             line=dict(color='#38bdf8', dash='dot'),
         ))
         fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="Leads")
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 with chart_cols[1]:
@@ -291,7 +289,7 @@ with chart_cols[1]:
             merged["lag_days"] = (merged["lead_date"] - merged["parent_lead_date"]).dt.days
             fig = px.histogram(merged, x="lag_days", nbins=25, color_discrete_sequence=["#22c55e"])
             fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), xaxis_title="Days", yaxis_title="Referrals")
-            st.plotly_chart(fig, width='stretch')
+            st.plotly_chart(fig, use_container_width=True)
     elif "is_referral" in events.columns and "RefDate" in events.columns:
         ref_df = events[events["is_referral"].fillna(False) & events["RefDate"].notna()].copy()
         if ref_df.empty:
@@ -300,7 +298,7 @@ with chart_cols[1]:
             ref_df["lag_days"] = (ref_df["RefDate"] - ref_df["lead_date"]).dt.days
             fig = px.histogram(ref_df, x="lag_days", nbins=25, color_discrete_sequence=["#22c55e"])
             fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), xaxis_title="Days", yaxis_title="Referrals")
-            st.plotly_chart(fig, width='stretch')
+            st.plotly_chart(fig, use_container_width=True)
     else:
         st.caption("Missing referral lag fields in Events data.")
     st.markdown('</div>', unsafe_allow_html=True)
@@ -321,7 +319,7 @@ else:
     display["Score"] = display["Score"].map(lambda v: f"{v:.1f}")
     net_gen = (leaderboard["RM"] >= 1.5) & (leaderboard["Lag Score"] >= 60)
     display["Net Generator"] = net_gen.map(lambda v: "✅" if v else "—")
-    st.dataframe(display, width='stretch', hide_index=True)
+    st.dataframe(display, use_container_width=True, hide_index=True)
 
     selected_payer = st.selectbox(
         "Drill into a payer",
@@ -367,7 +365,7 @@ else:
             fig.update_layout(annotations=annotations)
 
         fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="Leads")
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True)
 
 st.markdown('</div>', unsafe_allow_html=True)
 
@@ -396,11 +394,11 @@ else:
     plan_df["eCPR"] = plan_df["eCPR"].map(lambda v: f"${v:,.0f}")
     plan_df["Required Daily Leads"] = plan_df["Required Daily Leads"].map(lambda v: f"{v:.2f}")
     plan_df["Expected Pace Factor"] = plan_df["Expected Pace Factor"].map(lambda v: f"{v:.2f}" if pd.notna(v) else "-")
-    st.dataframe(plan_df, hide_index=True, width='stretch')
+    st.dataframe(plan_df, hide_index=True, use_container_width=True)
 
 if not timing_df.empty:
     st.markdown("**Media Timing Alerts**")
-    st.dataframe(timing_df, hide_index=True, width='stretch')
+    st.dataframe(timing_df, hide_index=True, use_container_width=True)
 
 st.markdown('</div>', unsafe_allow_html=True)
 
@@ -434,7 +432,6 @@ if not attribution_df.empty:
     st.dataframe(
         display_attr[['Payer', 'Spend', 'Direct_Leads', 'Total_System_Impact',
                       'Direct_CPR', 'System_CPR', 'CPR_Improvement', 'Avg_Cascade_Depth']],
-        width='stretch',
         hide_index=True
     )
 
@@ -465,7 +462,7 @@ if not attribution_df.empty:
             fig_hop = px.bar(hop_df, x="Hop", y="Attributed Leads",
                             color_discrete_sequence=["#22c55e"])
             fig_hop.update_layout(height=250, margin=dict(l=10, r=10, t=30, b=10))
-            st.plotly_chart(fig_hop, width='stretch')
+            st.plotly_chart(fig_hop, use_container_width=True)
 
 st.markdown('</div>', unsafe_allow_html=True)
 
@@ -531,7 +528,7 @@ if st.button("🚀 Run Optimization", key="run_optimization"):
                         for a in result.allocations[:20]
                     ])
                     st.markdown("**Top Spend Allocations**")
-                    st.dataframe(alloc_df, width='stretch', hide_index=True)
+                    st.dataframe(alloc_df, use_container_width=True, hide_index=True)
 
                 # Timing alerts
                 if result.timing_alerts:
@@ -565,7 +562,7 @@ else:
         "Attribution": s.attribution,
         "Confidence": f"{s.confidence:.0%}",
     } for s in spikes])
-    st.dataframe(spike_df, hide_index=True, width='stretch')
+    st.dataframe(spike_df, hide_index=True, use_container_width=True)
 
 st.markdown('</div>', unsafe_allow_html=True)
 
@@ -582,16 +579,16 @@ else:
         near_cap = near_cap.sort_values("Pacing_Factor", ascending=False)
         near_cap["Action"] = "Soft Pause / Reduce Daily Budget"
         st.markdown("**Builders Near Capacity**")
-        st.dataframe(near_cap[["Builder", "Pacing_Factor", "Action"]], hide_index=True, width='stretch')
+        st.dataframe(near_cap[["Builder", "Pacing_Factor", "Action"]], hide_index=True, use_container_width=True)
     if not under.empty:
         under = under.sort_values("Pacing_Factor", ascending=True)
         under["Action"] = "Increase Spend (fastest lag UTMs below)"
         st.markdown("**Builders Under-Pacing**")
-        st.dataframe(under[["Builder", "Pacing_Factor", "Action"]], hide_index=True, width='stretch')
+        st.dataframe(under[["Builder", "Pacing_Factor", "Action"]], hide_index=True, use_container_width=True)
         lag_by_ad = engine.compute_media_lag_by_ad_key(top_n=3)
         if not lag_by_ad.empty:
             st.caption("Top 3 ad_key by fastest media-to-lead lag")
-            st.dataframe(lag_by_ad, hide_index=True, width='stretch')
+            st.dataframe(lag_by_ad, hide_index=True, use_container_width=True)
 st.markdown('</div>', unsafe_allow_html=True)
 
 # Manifest download
