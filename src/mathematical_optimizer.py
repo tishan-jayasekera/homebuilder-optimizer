@@ -357,11 +357,17 @@ class MathematicalOptimizer:
             }
             solver = solver_map.get(config.solver, cp.SCS)
 
+            solver_opts = {}
+            if solver == cp.SCS:
+                solver_opts["max_iters"] = 10000
+            elif solver == cp.OSQP:
+                solver_opts["max_iter"] = 100000
+
             try:
                 problem.solve(
                     solver=solver,
                     verbose=config.verbose,
-                    max_iters=10000
+                    **solver_opts
                 )
             except Exception as e:
                 # Fallback if requested solver isn't available
