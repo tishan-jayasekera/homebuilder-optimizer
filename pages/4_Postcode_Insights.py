@@ -5,6 +5,7 @@ Understand referral rates and campaign density by postcode/suburb.
 import streamlit as st
 import pandas as pd
 import numpy as np
+import re
 import plotly.express as px
 import plotly.graph_objects as go
 import pydeck as pdk
@@ -878,8 +879,35 @@ def main():
             )
             if region_level == "Postcode":
                 region_options = sorted(group["Postcode"].dropna().astype(str).unique().tolist())
-                region_value = st.selectbox("Select postcode", region_options)
-                region_df = df[df[postcode_col].astype(str).str.zfill(4) == str(region_value).zfill(4)].copy()
+                region_set = set(region_options)
+                selected_postcodes = st.multiselect(
+                    "Select postcode(s)",
+                    region_options,
+                    default=region_options[:1],
+                )
+                pasted_raw = st.text_area(
+                    "Paste postcodes (comma/space/newline-separated)",
+                    placeholder="e.g. 3000, 3001\n3161 2000",
+                    height=80,
+                )
+                pasted_postcodes = []
+                if pasted_raw:
+                    tokens = re.findall(r"\d{1,4}", pasted_raw)
+                    pasted_postcodes = [t.zfill(4) for t in tokens]
+                invalid_postcodes = sorted({p for p in pasted_postcodes if p not in region_set})
+                if invalid_postcodes:
+                    st.warning(
+                        "Ignored postcodes not found: " + ", ".join(invalid_postcodes)
+                    )
+                combined = [p for p in pasted_postcodes if p in region_set] + selected_postcodes
+                selected_postcodes = list(dict.fromkeys(combined))
+                if not selected_postcodes:
+                    st.warning("Select or paste at least one postcode to continue.")
+                    region_df = df.iloc[0:0].copy()
+                else:
+                    region_df = df[
+                        df[postcode_col].astype(str).str.zfill(4).isin(selected_postcodes)
+                    ].copy()
             else:
                 region_map = (
                     group[["Postcode", "Suburb"]]
