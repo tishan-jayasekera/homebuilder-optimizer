@@ -3,6 +3,8 @@ Orphan Media Dashboard - Streamlit Page
 Filename: pages/2_Orphan_Media.py
 """
 import streamlit as st
+from src.streamlit_compat import patch_streamlit_width
+patch_streamlit_width(st)
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go

@@ -3,6 +3,8 @@ IBN HS Analytics - Main Entry Point
 Builder Economics & Referral Network Analysis Platform
 """
 import streamlit as st
+from src.streamlit_compat import patch_streamlit_width
+patch_streamlit_width(st)
 from pathlib import Path
 
 st.set_page_config(

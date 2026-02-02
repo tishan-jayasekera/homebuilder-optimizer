@@ -3,6 +3,8 @@ Referral Network Analysis
 Algorithmic campaign optimization with path-based efficiency analysis.
 """
 import streamlit as st
+from src.streamlit_compat import patch_streamlit_width
+patch_streamlit_width(st)
 import pandas as pd
 import numpy as np
 import networkx as nx

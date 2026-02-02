@@ -9,6 +9,8 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from src.streamlit_compat import patch_streamlit_width
+patch_streamlit_width(st)
 
 ROOT = Path(__file__).parent.parent
 if str(ROOT) not in sys.path:
