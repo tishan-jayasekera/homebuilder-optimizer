@@ -6,6 +6,192 @@ import pandas as pd
 import numpy as np
 from typing import List, Dict, Optional, Tuple
 
+def _find_col(columns, candidates):
+    col_map = {c.lower(): c for c in columns}
+    for cand in candidates:
+        if cand in columns:
+            return cand
+        if cand.lower() in col_map:
+            return col_map[cand.lower()]
+    return None
+
+def _normalize_bool(series: pd.Series) -> pd.Series:
+    if series is None:
+        return pd.Series(False, index=[])
+    if series.dtype == bool:
+        return series.fillna(False)
+    if pd.api.types.is_numeric_dtype(series):
+        return series.fillna(0).astype(float) > 0
+    numeric = pd.to_numeric(series, errors="coerce")
+    if numeric.notna().any():
+        return numeric.fillna(0).astype(float) > 0
+    s = series.fillna("").astype(str).str.strip().str.lower()
+    return s.isin(["true", "1", "yes", "y", "t"])
+
+def compute_lag_metrics_simple(events_df: pd.DataFrame) -> Dict[str, float]:
+    lead_date_col = _find_col(events_df.columns, ["lead_date", "LeadDate", "CreatedDate"])
+    ref_date_col = _find_col(events_df.columns, ["RefDate", "ref_date", "QualifiedDate"])
+    parent_id_col = _find_col(
+        events_df.columns,
+        ["ParentLeadId", "Parent_LeadId", "ParentLeadID", "ReferrerLeadId", "Referrer_LeadId", "RefLeadId", "ParentLead", "ReferrerLead"],
+    )
+    lead_id_col = _find_col(events_df.columns, ["LeadId", "lead_id", "LeadID"])
+
+    if lead_date_col:
+        events_df[lead_date_col] = pd.to_datetime(events_df[lead_date_col], errors="coerce")
+    if ref_date_col:
+        events_df[ref_date_col] = pd.to_datetime(events_df[ref_date_col], errors="coerce")
+
+    L_conv = 0.0
+    if lead_date_col and ref_date_col:
+        mask = events_df[ref_date_col].notna()
+        if mask.any():
+            L_conv = (events_df.loc[mask, ref_date_col] - events_df.loc[mask, lead_date_col]).dt.days.median()
+
+    L_ref = 0.0
+    if parent_id_col and lead_id_col and lead_date_col:
+        parent_dates = events_df[[lead_id_col, lead_date_col]].dropna().rename(
+            columns={lead_id_col: "parent_id", lead_date_col: "parent_lead_date"}
+        )
+        child = events_df[[parent_id_col, lead_date_col]].dropna()
+        merged = child.merge(parent_dates, left_on=parent_id_col, right_on="parent_id", how="inner")
+        if not merged.empty:
+            L_ref = (merged[lead_date_col] - merged["parent_lead_date"]).dt.days.median()
+
+    return {"L_conv": float(L_conv or 0), "L_ref": float(L_ref or 0)}
+
+def build_builder_targets(events_df: pd.DataFrame) -> pd.DataFrame:
+    dest_col = _find_col(events_df.columns, ["Dest_BuilderRegionKey"])
+    target_col = _find_col(events_df.columns, ["LeadTarget_from_job", "LeadTarget"])
+    start_col = _find_col(events_df.columns, ["WIP_JOB_LIVE_START", "JobLiveStart"])
+    end_col = _find_col(events_df.columns, ["WIP_JOB_LIVE_END", "JobLiveEnd"])
+    lead_date_col = _find_col(events_df.columns, ["lead_date", "LeadDate", "CreatedDate"])
+
+    if not dest_col or not target_col:
+        return pd.DataFrame()
+
+    df = events_df[[dest_col, target_col]].dropna().drop_duplicates(dest_col).copy()
+    if start_col and end_col:
+        df[start_col] = pd.to_datetime(events_df[start_col], errors="coerce")
+        df[end_col] = pd.to_datetime(events_df[end_col], errors="coerce")
+    if lead_date_col and lead_date_col in events_df.columns:
+        min_date = pd.to_datetime(events_df[lead_date_col], errors="coerce").min()
+        max_date = pd.to_datetime(events_df[lead_date_col], errors="coerce").max()
+    else:
+        min_date = pd.Timestamp.now() - pd.Timedelta(days=30)
+        max_date = pd.Timestamp.now()
+
+    rows = []
+    for _, row in df.iterrows():
+        builder = row[dest_col]
+        target = pd.to_numeric(row[target_col], errors="coerce")
+        if pd.isna(target) or target <= 0:
+            continue
+        start = row.get(start_col, min_date) if start_col else min_date
+        end = row.get(end_col, max_date) if end_col else max_date
+        if pd.isna(start):
+            start = min_date
+        if pd.isna(end):
+            end = max_date
+        duration = max((end - start).days, 1)
+        rows.append({
+            "Builder": builder,
+            "LeadTarget": float(target),
+            "JobStart": start,
+            "JobEnd": end,
+            "DailyTarget": float(target) / duration,
+        })
+    return pd.DataFrame(rows)
+
+def build_prescriptive_plan(
+    events_df: pd.DataFrame,
+    leverage_df: pd.DataFrame,
+    shortfalls_df: pd.DataFrame,
+    media_raw_df: Optional[pd.DataFrame] = None,
+    lag_metrics: Optional[Dict[str, float]] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Return prescriptive plan rows and timing alerts."""
+    if shortfalls_df is None or shortfalls_df.empty or leverage_df is None or leverage_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    lead_date_col = _find_col(events_df.columns, ["lead_date", "LeadDate", "CreatedDate"])
+    payer_col = _find_col(events_df.columns, ["MediaPayer_BuilderRegionKey"])
+    is_origin_col = _find_col(events_df.columns, ["is_origin", "IsOrigin"])
+    cost_col = _find_col(events_df.columns, ["MediaCost_referral_event", "MediaCost_origin_lead", "MediaCost"])
+    dest_col = _find_col(events_df.columns, ["Dest_BuilderRegionKey"])
+
+    if lead_date_col:
+        events_df[lead_date_col] = pd.to_datetime(events_df[lead_date_col], errors="coerce")
+
+    # Payer CPL
+    payer_spend = events_df.groupby(payer_col)[cost_col].sum() if payer_col and cost_col else pd.Series()
+    direct = events_df[_normalize_bool(events_df[is_origin_col]) == True].groupby(payer_col).size() if payer_col and is_origin_col else pd.Series()
+    payer_cpl = (payer_spend / direct.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+
+    # Builder targets and pacing
+    targets = build_builder_targets(events_df)
+    targets_map = targets.set_index("Builder")["DailyTarget"].to_dict() if not targets.empty else {}
+
+    # Lag totals for timing
+    lags = lag_metrics or compute_lag_metrics_simple(events_df)
+    total_lag = float(lags.get("L_conv", 0)) + float(lags.get("L_ref", 0))
+
+    plan_rows = []
+    timing_rows = []
+
+    at_risk = shortfalls_df[shortfalls_df["Projected_Shortfall"] > 0].copy()
+    for _, row in at_risk.iterrows():
+        target = row["BuilderRegionKey"]
+        gap = float(row["Projected_Shortfall"])
+        if gap <= 0:
+            continue
+
+        target_rows = leverage_df[leverage_df["Dest_BuilderRegionKey"] == target].copy()
+        if target_rows.empty:
+            continue
+
+        target_rows["Payer_CPL"] = target_rows["MediaPayer_BuilderRegionKey"].map(payer_cpl).fillna(np.nan)
+        target_rows["eCPR"] = target_rows["Payer_CPL"] / target_rows["Transfer_Rate"].replace(0, np.nan)
+        target_rows = target_rows.replace([np.inf, -np.inf], np.nan).dropna(subset=["eCPR"])
+        if target_rows.empty:
+            continue
+
+        target_rows = target_rows.sort_values("eCPR")
+        best = target_rows.iloc[0]
+        required_budget = gap * best["eCPR"]
+
+        # Pace factor estimate
+        daily_target = targets_map.get(target, np.nan)
+        expected_pace = np.nan
+        if not np.isnan(daily_target) and daily_target > 0 and lead_date_col:
+            current = events_df[events_df[dest_col] == target].shape[0] if dest_col else 0
+            expected_pace = (current + gap) / (daily_target * max(row.get("Days_Remaining", 1), 1))
+
+        plan_rows.append({
+            "Target Builder": target,
+            "Gap": gap,
+            "Optimal Payer": best["MediaPayer_BuilderRegionKey"],
+            "Transfer Rate": best["Transfer_Rate"],
+            "eCPR": best["eCPR"],
+            "Required Budget": required_budget,
+            "Expected Pace Factor": expected_pace,
+        })
+
+        # Timing alert
+        if "WIP_JOB_LIVE_END" in row and pd.notna(row["WIP_JOB_LIVE_END"]):
+            end_date = pd.to_datetime(row["WIP_JOB_LIVE_END"], errors="coerce")
+            last_spend_date = end_date - pd.Timedelta(days=total_lag)
+            timing_rows.append({
+                "Builder": target,
+                "Job End": end_date.date() if pd.notna(end_date) else None,
+                "Total Lag (days)": total_lag,
+                "Last Spend Date": last_spend_date.date() if pd.notna(last_spend_date) else None,
+                "Message": f"Increase spend now to impact {end_date.date()} targets."
+            })
+
+    plan_df = pd.DataFrame(plan_rows)
+    timing_df = pd.DataFrame(timing_rows)
+    return plan_df, timing_df
 def calculate_shortfalls(
     events_df: pd.DataFrame, 
     targets_df: pd.DataFrame = None, 

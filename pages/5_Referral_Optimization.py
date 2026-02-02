@@ -401,6 +401,12 @@ st.markdown('</div>', unsafe_allow_html=True)
 # Manifest download
 manifest = json.loads(engine.get_manifest())
 manifest["parameters"]["optimization_score_weights"] = weights
+manifest["parameters"]["prescriptive_rules"] = {
+    "pacing_cap": 1.2,
+    "pacing_buffer": 1.1,
+    "spend_spike_multiplier": 1.5,
+    "spike_iqr_multiplier": 2.5,
+}
 manifest["parameters"]["use_builder_targets"] = use_builder_targets
 manifest["parameters"]["target_leads_per_month"] = None if use_builder_targets else target_leads
 manifest_bytes = json.dumps(manifest, indent=2).encode("utf-8")

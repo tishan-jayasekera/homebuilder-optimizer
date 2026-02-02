@@ -18,11 +18,11 @@ root = Path(__file__).parent.parent
 if str(root) not in sys.path:
     sys.path.insert(0, str(root))
 
-from src.data_loader import load_events, export_to_excel
+from src.data_loader import load_events, load_origin_perf, load_media_raw, export_to_excel
 from src.normalization import normalize_events
 from src.referral_clusters import run_referral_clustering
 from src.builder_pnl import build_builder_pnl
-from src.network_optimization import calculate_shortfalls, analyze_network_leverage
+from src.network_optimization import calculate_shortfalls, analyze_network_leverage, build_prescriptive_plan, compute_lag_metrics_simple
 
 st.set_page_config(page_title="Referral Network Analysis", page_icon="🔗", layout="wide")
 
@@ -924,6 +924,10 @@ def main():
         else:
             st.caption("No targets selected")
     
+    # Optional inputs for prescriptive planning
+    origin_file = st.session_state.get("origin_file")
+    media_file = st.session_state.get("media_file")
+
     # Process data
     if isinstance(date_range, (list, tuple)) and len(date_range) == 2 and all(date_range):
         start_d, end_d = date_range[0], date_range[1]
@@ -935,6 +939,7 @@ def main():
     G = data['graph']
     bm = data['builder_master']
     sf = data['shortfalls']
+    lag_metrics = compute_lag_metrics_simple(events)
 
     if st.session_state.load_critical_targets and not sf.empty:
         critical = sf[sf["Risk_Score"] > 50].copy()
@@ -1675,6 +1680,41 @@ def main():
                     hide_index=True,
                     use_container_width=True
                 )
+
+    # ========================================================================
+    # SECTION 5: PRESCRIPTIVE STRATEGY
+    # ========================================================================
+    if not sf.empty and not data['leverage'].empty:
+        st.markdown("""
+        <div class="section">
+            <div class="section-header">
+                <span class="section-num">5</span>
+                <span class="section-title">Prescriptive Strategy</span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        plan_df, timing_df = build_prescriptive_plan(
+            events_df=data["events"],
+            leverage_df=data["leverage"],
+            shortfalls_df=sf,
+            media_raw_df=None,
+            lag_metrics=lag_metrics,
+        )
+
+        if plan_df.empty:
+            st.caption("No prescriptive recommendations available yet.")
+        else:
+            plan_df["Required Budget"] = plan_df["Required Budget"].map(lambda v: f"${v:,.0f}")
+            plan_df["Transfer Rate"] = plan_df["Transfer Rate"].map(lambda v: f"{v:.0%}")
+            plan_df["eCPR"] = plan_df["eCPR"].map(lambda v: f"${v:,.0f}")
+            plan_df["Expected Pace Factor"] = plan_df["Expected Pace Factor"].map(lambda v: f"{v:.2f}" if pd.notna(v) else "-")
+            st.markdown("**Active Campaign Plan**")
+            st.dataframe(plan_df, hide_index=True, use_container_width=True)
+
+        if not timing_df.empty:
+            st.markdown("**Media Timing Alerts**")
+            st.dataframe(timing_df, hide_index=True, use_container_width=True)
 
 
 if __name__ == "__main__":
