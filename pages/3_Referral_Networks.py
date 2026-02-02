@@ -1690,51 +1690,6 @@ def main():
                     use_container_width=True
                 )
 
-    # ========================================================================
-    # SECTION 5: PRESCRIPTIVE STRATEGY
-    # ========================================================================
-    st.markdown("""
-    <div class="section">
-        <div class="section-header">
-            <span class="section-num">5</span>
-            <span class="section-title">Prescriptive Strategy</span>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    if sf.empty or data['leverage'].empty:
-        st.caption("Prescriptive Strategy needs both Shortfalls and Leverage data to render.")
-        st.caption(f"Shortfalls rows: {len(sf)} | Leverage rows: {len(data['leverage'])}")
-        missing_cols = []
-        for col in ["MediaPayer_BuilderRegionKey", "Dest_BuilderRegionKey", "LeadTarget_from_job", "WIP_JOB_LIVE_END"]:
-            if col not in data["events"].columns:
-                missing_cols.append(col)
-        if missing_cols:
-            st.caption("Missing columns in Events: " + ", ".join(missing_cols))
-    else:
-        plan_df, timing_df = build_prescriptive_plan(
-            events_df=data["events"],
-            leverage_df=data["leverage"],
-            shortfalls_df=sf,
-            media_raw_df=None,
-            lag_metrics=lag_metrics,
-        )
-
-        if plan_df.empty:
-            st.caption("No prescriptive recommendations available yet.")
-            st.caption(f"Shortfalls rows: {len(sf)} | Leverage rows: {len(data['leverage'])}")
-        else:
-            plan_df["Required Budget"] = plan_df["Required Budget"].map(lambda v: f"${v:,.0f}")
-            plan_df["Transfer Rate"] = plan_df["Transfer Rate"].map(lambda v: f"{v:.0%}")
-            plan_df["eCPR"] = plan_df["eCPR"].map(lambda v: f"${v:,.0f}")
-            plan_df["Expected Pace Factor"] = plan_df["Expected Pace Factor"].map(lambda v: f"{v:.2f}" if pd.notna(v) else "-")
-            st.markdown("**Active Campaign Plan**")
-            st.dataframe(plan_df, hide_index=True, use_container_width=True)
-
-        if not timing_df.empty:
-            st.markdown("**Media Timing Alerts**")
-            st.dataframe(timing_df, hide_index=True, use_container_width=True)
-
 
 if __name__ == "__main__":
     main()

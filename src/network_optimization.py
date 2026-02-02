@@ -119,22 +119,52 @@ def build_prescriptive_plan(
     is_origin_col = _find_col(events_df.columns, ["is_origin", "IsOrigin"])
     cost_col = _find_col(events_df.columns, ["MediaCost_referral_event", "MediaCost_origin_lead", "MediaCost"])
     dest_col = _find_col(events_df.columns, ["Dest_BuilderRegionKey"])
+    parent_id_col = _find_col(
+        events_df.columns,
+        ["ParentLeadId", "Parent_LeadId", "ParentLeadID", "ReferrerLeadId", "Referrer_LeadId", "RefLeadId", "ParentLead", "ReferrerLead"],
+    )
+    lead_id_col = _find_col(events_df.columns, ["LeadId", "lead_id", "LeadID"])
 
     if lead_date_col:
         events_df[lead_date_col] = pd.to_datetime(events_df[lead_date_col], errors="coerce")
 
-    # Payer CPL
-    payer_spend = events_df.groupby(payer_col)[cost_col].sum() if payer_col and cost_col else pd.Series()
-    direct = events_df[_normalize_bool(events_df[is_origin_col]) == True].groupby(payer_col).size() if payer_col and is_origin_col else pd.Series()
-    payer_cpl = (payer_spend / direct.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+    # Payer CPL_net using total (direct + downstream) leads attributed to payer
+    attrib_col = "_attributed_payer" if "_attributed_payer" in events_df.columns else payer_col
+    if attrib_col is None:
+        return pd.DataFrame(), pd.DataFrame()
+
+    payer_spend = events_df.groupby(attrib_col)[cost_col].sum() if cost_col else pd.Series()
+    total_leads = events_df.groupby(attrib_col).size()
+    direct = events_df[_normalize_bool(events_df[is_origin_col]) == True].groupby(attrib_col).size() if is_origin_col else pd.Series()
+    rm = (total_leads / direct.replace(0, np.nan)).fillna(1.0)
+    payer_cpl_net = (payer_spend / total_leads.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
 
     # Builder targets and pacing
     targets = build_builder_targets(events_df)
     targets_map = targets.set_index("Builder")["DailyTarget"].to_dict() if not targets.empty else {}
+    job_end_map = targets.set_index("Builder")["JobEnd"].to_dict() if not targets.empty and "JobEnd" in targets.columns else {}
 
     # Lag totals for timing
     lags = lag_metrics or compute_lag_metrics_simple(events_df)
     total_lag = float(lags.get("L_conv", 0)) + float(lags.get("L_ref", 0))
+
+    # Net generators: RM >= 1.5 and low referral lag (<= global median)
+    net_generators = set()
+    if parent_id_col and lead_id_col and lead_date_col:
+        parent_dates = events_df[[lead_id_col, lead_date_col]].dropna().rename(
+            columns={lead_id_col: "parent_id", lead_date_col: "parent_lead_date"}
+        )
+        child = events_df[[parent_id_col, lead_date_col, attrib_col]].dropna()
+        merged = child.merge(parent_dates, left_on=parent_id_col, right_on="parent_id", how="inner")
+        if not merged.empty:
+            merged["lag"] = (merged[lead_date_col] - merged["parent_lead_date"]).dt.days
+            lag_by_payer = merged.groupby(attrib_col)["lag"].median()
+            lag_threshold = lag_by_payer.median() if not lag_by_payer.empty else lags.get("L_ref", 0)
+            for payer, lag_val in lag_by_payer.items():
+                if rm.get(payer, 1.0) >= 1.5 and lag_val <= lag_threshold:
+                    net_generators.add(payer)
+    else:
+        net_generators = set(rm[rm >= 1.5].index.tolist())
 
     plan_rows = []
     timing_rows = []
@@ -150,8 +180,13 @@ def build_prescriptive_plan(
         if target_rows.empty:
             continue
 
-        target_rows["Payer_CPL"] = target_rows["MediaPayer_BuilderRegionKey"].map(payer_cpl).fillna(np.nan)
-        target_rows["eCPR"] = target_rows["Payer_CPL"] / target_rows["Transfer_Rate"].replace(0, np.nan)
+        # Only net generators supply
+        target_rows = target_rows[target_rows["MediaPayer_BuilderRegionKey"].isin(net_generators)]
+        if target_rows.empty:
+            continue
+
+        target_rows["Payer_CPL_net"] = target_rows["MediaPayer_BuilderRegionKey"].map(payer_cpl_net).fillna(np.nan)
+        target_rows["eCPR"] = target_rows["Payer_CPL_net"] / target_rows["Transfer_Rate"].replace(0, np.nan)
         target_rows = target_rows.replace([np.inf, -np.inf], np.nan).dropna(subset=["eCPR"])
         if target_rows.empty:
             continue
@@ -166,6 +201,7 @@ def build_prescriptive_plan(
         if not np.isnan(daily_target) and daily_target > 0 and lead_date_col:
             current = events_df[events_df[dest_col] == target].shape[0] if dest_col else 0
             expected_pace = (current + gap) / (daily_target * max(row.get("Days_Remaining", 1), 1))
+        required_daily = gap / max(row.get("Days_Remaining", 1), 1)
 
         plan_rows.append({
             "Target Builder": target,
@@ -175,11 +211,12 @@ def build_prescriptive_plan(
             "eCPR": best["eCPR"],
             "Required Budget": required_budget,
             "Expected Pace Factor": expected_pace,
+            "Required Daily Leads": required_daily,
         })
 
         # Timing alert
-        if "WIP_JOB_LIVE_END" in row and pd.notna(row["WIP_JOB_LIVE_END"]):
-            end_date = pd.to_datetime(row["WIP_JOB_LIVE_END"], errors="coerce")
+        end_date = job_end_map.get(target)
+        if end_date is not None and pd.notna(end_date):
             last_spend_date = end_date - pd.Timedelta(days=total_lag)
             timing_rows.append({
                 "Builder": target,

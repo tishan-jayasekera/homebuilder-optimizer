@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
 from src.data_loader import load_events, load_origin_perf, load_media_raw
 from src.normalization import normalize_events
 from src.optimization_engine import ReferralOptimizationEngine
+from src.network_optimization import build_prescriptive_plan, compute_lag_metrics_simple, analyze_network_leverage, calculate_shortfalls
 
 
 st.set_page_config(
@@ -363,6 +364,39 @@ else:
 
         fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="Leads")
         st.plotly_chart(fig, use_container_width=True)
+
+st.markdown('</div>', unsafe_allow_html=True)
+
+# Prescriptive Strategy
+st.markdown('<div class="section-card">', unsafe_allow_html=True)
+st.markdown("**Prescriptive Strategy**")
+events_for_plan = events.copy()
+lag_simple = compute_lag_metrics_simple(events_for_plan)
+leverage_df = analyze_network_leverage(events_for_plan)
+shortfalls_df = calculate_shortfalls(events_for_plan, total_events_df=events_for_plan)
+
+plan_df, timing_df = build_prescriptive_plan(
+    events_df=events_for_plan,
+    leverage_df=leverage_df,
+    shortfalls_df=shortfalls_df,
+    media_raw_df=None,
+    lag_metrics=lag_simple,
+)
+
+if plan_df.empty:
+    st.caption("No prescriptive recommendations available yet.")
+    st.caption(f"Shortfalls rows: {len(shortfalls_df)} | Leverage rows: {len(leverage_df)}")
+else:
+    plan_df["Required Budget"] = plan_df["Required Budget"].map(lambda v: f"${v:,.0f}")
+    plan_df["Transfer Rate"] = plan_df["Transfer Rate"].map(lambda v: f"{v:.0%}")
+    plan_df["eCPR"] = plan_df["eCPR"].map(lambda v: f"${v:,.0f}")
+    plan_df["Required Daily Leads"] = plan_df["Required Daily Leads"].map(lambda v: f"{v:.2f}")
+    plan_df["Expected Pace Factor"] = plan_df["Expected Pace Factor"].map(lambda v: f"{v:.2f}" if pd.notna(v) else "-")
+    st.dataframe(plan_df, hide_index=True, use_container_width=True)
+
+if not timing_df.empty:
+    st.markdown("**Media Timing Alerts**")
+    st.dataframe(timing_df, hide_index=True, use_container_width=True)
 
 st.markdown('</div>', unsafe_allow_html=True)
 
