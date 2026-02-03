@@ -117,7 +117,7 @@ class ReferralOptimizationEngine:
         # Preprocess data
         self._preprocess_data()
         if lite:
-            self._build_builder_targets()
+            self.builder_targets = self._build_builder_targets()
             self.attributor = None
             self._attribution_helpers = {}
             self.pacing_validator = None
@@ -870,7 +870,13 @@ class ReferralOptimizationEngine:
         max_schedule_rows: int = 50000,
         max_builders_per_ad: int = 200,
         media_raw_df: Optional[pd.DataFrame] = None,
-        active_only: bool = True
+        active_only: bool = True,
+        leakage_cap_pct: float = 0.2,
+        smoothing_alpha: float = 1.0,
+        min_leads_per_ad: int = 20,
+        min_edge_leads: int = 5,
+        min_lag_samples: int = 30,
+        include_ad_keys: Optional[List[str]] = None
     ) -> FastOptimizationResult:
         """
         Fast heuristic allocator for spend planning with traceability.
@@ -910,6 +916,10 @@ class ReferralOptimizationEngine:
                     notes.append(f"Filtered to active campaigns: {before} → {len(events)} events.")
             else:
                 notes.append("Active-only filter skipped (missing effective_status/ad_key in media data).")
+        if include_ad_keys:
+            before = len(events)
+            events = events[events[ad_col].astype(str).isin([str(k) for k in include_ad_keys])]
+            notes.append(f"Filtered to selected campaigns: {before} → {len(events)} events.")
         if events.empty:
             return FastOptimizationResult(
                 status="error",
@@ -924,7 +934,10 @@ class ReferralOptimizationEngine:
         windows = self._builder_windows()
         builder_rows = []
         builder_shortfall = {}
+        present_builders = set(events[dest_col].dropna().unique()) if dest_col else set()
         for builder, daily_target in self.builder_targets.items():
+            if present_builders and builder not in present_builders:
+                continue
             window = windows.get(builder)
             if not window:
                 continue
@@ -938,16 +951,67 @@ class ReferralOptimizationEngine:
                 days = max((eff_end - eff_start).days + 1, 1)
                 target_total = float(daily_target) * days
             target_total *= max(lead_target_scale, 0.0)
-            builder_shortfall[builder] = target_total
+            actual_to_date = 0
+            if lead_date_col and lead_date_col in self.events.columns:
+                actual_to_date = self.events[
+                    (self.events[dest_col] == builder) &
+                    (self.events[lead_date_col].between(eff_start, min(pd.Timestamp.now().normalize(), eff_end)))
+                ].shape[0]
+            shortfall = max(target_total - actual_to_date, 0.0)
+            builder_shortfall[builder] = shortfall
             builder_rows.append({
                 "Builder": builder,
                 "DailyTarget": daily_target,
                 "TargetDays": days,
                 "TargetTotal": target_total,
+                "ActualToDate": actual_to_date,
+                "Shortfall": shortfall,
                 "WindowStart": eff_start,
                 "WindowEnd": eff_end
             })
         builder_targets_df = pd.DataFrame(builder_rows)
+        if builder_targets_df.empty:
+            notes.append("No builder targets found; check LeadTarget columns.")
+
+        # Current pacing summary (all events, not just active-filtered)
+        pacing_summary = pd.DataFrame()
+        lead_date_col = self.cols.get("lead_date")
+        if not builder_targets_df.empty and lead_date_col and lead_date_col in self.events.columns and dest_col:
+            today = pd.Timestamp.now().normalize()
+            rows = []
+            total_actual = 0
+            total_target = 0.0
+            for _, row in builder_targets_df.iterrows():
+                builder = row["Builder"]
+                daily_target = row["DailyTarget"]
+                window_start = pd.to_datetime(row["WindowStart"])
+                window_end = pd.to_datetime(row["WindowEnd"])
+                if today < window_start:
+                    elapsed_days = 0
+                else:
+                    elapsed_end = min(today, window_end, horizon_end)
+                    elapsed_days = max((elapsed_end - window_start).days + 1, 0)
+                target_to_date = daily_target * elapsed_days
+                actual = self.events[
+                    (self.events[dest_col] == builder) &
+                    (self.events[lead_date_col].between(window_start, min(today, window_end)))
+                ].shape[0]
+                total_actual += actual
+                total_target += target_to_date
+                pace = actual / target_to_date if target_to_date > 0 else 1.0
+                rows.append({
+                    "Builder": builder,
+                    "Actual_Leads": actual,
+                    "Target_Leads_To_Date": target_to_date,
+                    "Pace_Factor": pace
+                })
+            rows.append({
+                "Builder": "ALL",
+                "Actual_Leads": total_actual,
+                "Target_Leads_To_Date": total_target,
+                "Pace_Factor": (total_actual / total_target) if total_target > 0 else 1.0
+            })
+            pacing_summary = pd.DataFrame(rows)
 
         # Ad performance
         perf = events.groupby(ad_col).agg(
@@ -966,13 +1030,66 @@ class ReferralOptimizationEngine:
             .size()
             .reset_index(name="lead_count")
         )
+        if min_edge_leads and min_edge_leads > 1:
+            dest_counts = dest_counts[dest_counts["lead_count"] >= min_edge_leads]
+
         dest_totals = dest_counts.groupby(ad_col)["lead_count"].sum().reset_index(name="total")
+        if min_leads_per_ad and min_leads_per_ad > 1:
+            low_volume_ads = dest_totals[dest_totals["total"] < min_leads_per_ad][ad_col].tolist()
+            if low_volume_ads:
+                dest_counts = dest_counts[~dest_counts[ad_col].isin(low_volume_ads)]
+                dest_totals = dest_totals[~dest_totals[ad_col].isin(low_volume_ads)]
+                notes.append(f"Excluded {len(low_volume_ads)} low-volume campaigns (<{min_leads_per_ad} leads).")
+
         dest_shares = dest_counts.merge(dest_totals, on=ad_col, how="left")
-        dest_shares["share"] = dest_shares["lead_count"] / dest_shares["total"].replace(0, np.nan)
+        if smoothing_alpha and smoothing_alpha > 0:
+            counts_per_ad = dest_shares.groupby(ad_col)["lead_count"].transform("count")
+            dest_shares["share"] = (dest_shares["lead_count"] + smoothing_alpha) / (
+                dest_shares["total"] + smoothing_alpha * counts_per_ad
+            )
+        else:
+            dest_shares["share"] = dest_shares["lead_count"] / dest_shares["total"].replace(0, np.nan)
         dest_shares["share"] = dest_shares["share"].fillna(0)
+
+        if not dest_shares.empty:
+            perf = perf[perf[ad_col].isin(dest_shares[ad_col].unique())]
 
         # Sort sources by CPL (ascending)
         perf = perf.sort_values("cpl", ascending=True)
+
+        # Lag curves (empirical if available, else global fallback)
+        max_lag_days = min(30, horizon_days)
+        ref_date_col = self.cols.get("ref_date")
+        global_curve = None
+        if lead_date_col and ref_date_col and lead_date_col in events.columns and ref_date_col in events.columns:
+            lags_all = (events[ref_date_col] - events[lead_date_col]).dt.days
+            lags_all = lags_all[(lags_all.notna()) & (lags_all >= 0) & (lags_all <= max_lag_days)]
+            if len(lags_all) > 0:
+                counts, _ = np.histogram(lags_all, bins=max_lag_days + 1, range=(0, max_lag_days + 1))
+                if counts.sum() > 0:
+                    global_curve = counts / counts.sum()
+
+        lag_curves: Dict[str, np.ndarray] = {}
+
+        def get_lag_curve(ad_key: str) -> np.ndarray:
+            if ad_key in lag_curves:
+                return lag_curves[ad_key]
+            curve = None
+            if lead_date_col and ref_date_col and lead_date_col in events.columns and ref_date_col in events.columns:
+                subset = events[events[ad_col] == ad_key]
+                lags = (subset[ref_date_col] - subset[lead_date_col]).dt.days
+                lags = lags[(lags.notna()) & (lags >= 0) & (lags <= max_lag_days)]
+                if len(lags) >= min_lag_samples:
+                    counts, _ = np.histogram(lags, bins=max_lag_days + 1, range=(0, max_lag_days + 1))
+                    if counts.sum() > 0:
+                        curve = counts / counts.sum()
+            if curve is None:
+                if global_curve is not None:
+                    curve = global_curve
+                else:
+                    curve = self._build_lag_curve(ad_key, max_lag_days=max_lag_days)
+            lag_curves[ad_key] = curve
+            return curve
 
         allocations = []
         budget_remaining = float(total_budget)
@@ -1032,12 +1149,176 @@ class ReferralOptimizationEngine:
                 break
 
         allocations_df = pd.DataFrame(allocations)
+        leakage_cap_applied = False
+        if not allocations_df.empty and leakage_cap_pct is not None and leakage_cap_pct < 1.0:
+            adjusted = []
+            for _, alloc in allocations_df.iterrows():
+                ad_key = alloc["ad_key"]
+                spend = float(alloc["spend"])
+                lpd = float(alloc["leads_per_dollar"])
+                share_df = dest_shares[dest_shares[ad_col] == ad_key].sort_values("share", ascending=False)
+                if share_df.empty or spend <= 0 or lpd <= 0:
+                    adjusted.append(alloc)
+                    continue
+
+                total_expected = spend * lpd
+                shares = share_df[dest_col].tolist()
+                weights = share_df["share"].values.astype(float)
+
+                def leakage_pct(scale: float) -> float:
+                    expected = total_expected * scale
+                    if expected <= 0:
+                        return 0.0
+                    useful = 0.0
+                    for b, w in zip(shares, weights):
+                        if w <= 0:
+                            continue
+                        shortfall = float(builder_shortfall.get(b, 0.0))
+                        useful += min(expected * w, shortfall)
+                    return max(0.0, 1.0 - (useful / expected))
+
+                current_leak = leakage_pct(1.0)
+                if current_leak <= leakage_cap_pct:
+                    adjusted.append(alloc)
+                    continue
+                leakage_cap_applied = True
+
+                lo, hi = 0.0, 1.0
+                for _ in range(20):
+                    mid = (lo + hi) / 2.0
+                    if leakage_pct(mid) <= leakage_cap_pct:
+                        lo = mid
+                    else:
+                        hi = mid
+                scale = lo
+                if scale <= 0:
+                    alloc["spend"] = 0.0
+                else:
+                    alloc["spend"] = spend * scale
+                adjusted.append(alloc)
+
+            allocations_df = pd.DataFrame(adjusted)
+            if leakage_cap_applied:
+                notes.append(f"Leakage cap applied at {leakage_cap_pct:.0%}.")
+
+        # Simple refinement: allocate remaining budget within headroom and leakage cap
+        remaining_budget = total_budget - float(allocations_df["spend"].sum()) if not allocations_df.empty else total_budget
+        if remaining_budget > 0 and not perf.empty:
+            current_spend = allocations_df.groupby("ad_key")["spend"].sum().to_dict() if not allocations_df.empty else {}
+
+            def max_spend_allowed(ad_key: str, lpd: float) -> float:
+                if lpd <= 0:
+                    return 0.0
+                share_df = dest_shares[dest_shares[ad_col] == ad_key]
+                if share_df.empty:
+                    return 0.0
+
+                def leakage_pct_spend(spend: float) -> float:
+                    expected = spend * lpd
+                    if expected <= 0:
+                        return 0.0
+                    useful = 0.0
+                    for _, srow in share_df.iterrows():
+                        share = float(srow["share"])
+                        if share <= 0:
+                            continue
+                        shortfall = float(builder_shortfall.get(srow[dest_col], 0.0))
+                        useful += min(expected * share, shortfall)
+                    return max(0.0, 1.0 - (useful / expected))
+
+                cap_budget = max_per_source
+                if leakage_cap_pct is None or leakage_cap_pct >= 1.0:
+                    return cap_budget
+                if leakage_pct_spend(cap_budget) <= leakage_cap_pct:
+                    return cap_budget
+                lo, hi = 0.0, cap_budget
+                for _ in range(20):
+                    mid = (lo + hi) / 2.0
+                    if leakage_pct_spend(mid) <= leakage_cap_pct:
+                        lo = mid
+                    else:
+                        hi = mid
+                return lo
+
+            headroom = {}
+            for _, row in perf.iterrows():
+                ad_key = row[ad_col]
+                lpd = float(row["leads_per_dollar"])
+                max_allowed = max_spend_allowed(ad_key, lpd)
+                used = current_spend.get(ad_key, 0.0)
+                headroom[ad_key] = max(0.0, max_allowed - used)
+
+            eligible = [k for k, v in headroom.items() if v > 0 and k in scores]
+            if eligible:
+                total_score = sum(scores[k] for k in eligible)
+                additions = {}
+                for ad_key in eligible:
+                    proposed = remaining_budget * (scores[ad_key] / total_score) if total_score > 0 else 0.0
+                    add = min(proposed, headroom[ad_key])
+                    if add > 0:
+                        additions[ad_key] = add
+                if additions:
+                    for ad_key, add in additions.items():
+                        if ad_key in current_spend:
+                            allocations_df.loc[allocations_df["ad_key"] == ad_key, "spend"] += add
+                        else:
+                            lpd = float(perf.loc[perf[ad_col] == ad_key, "leads_per_dollar"].values[0])
+                            allocations_df = pd.concat([allocations_df, pd.DataFrame([{
+                                "ad_key": ad_key,
+                                "spend": add,
+                                "leads_per_dollar": lpd,
+                                "score": scores.get(ad_key, 0.0)
+                            }])], ignore_index=True)
+                    notes.append("Refined allocation to use remaining budget within leakage cap.")
+
+        strategy_summary = {}
+        is_origin_col = self.cols.get("is_origin")
+        is_referral_col = self.cols.get("is_referral")
+        if is_origin_col and is_referral_col and cost_col in self.events.columns:
+            direct_leads = int(self.events[is_origin_col].sum())
+            referral_leads = int(self.events[is_referral_col].sum())
+            total_leads = direct_leads + referral_leads
+            total_spend = float(self.events[cost_col].sum())
+            rm = (total_leads / direct_leads) if direct_leads > 0 else 1.0
+            referral_share = (referral_leads / total_leads) if total_leads > 0 else 0.0
+            system_cpr = (total_spend / total_leads) if total_leads > 0 else float("inf")
+            direct_cpl = (total_spend / direct_leads) if direct_leads > 0 else float("inf")
+            recommendation = "Network Leverage"
+            rationale = "Referral share and multiplier indicate downstream efficiency."
+            if referral_share < 0.25 or rm < 1.1:
+                recommendation = "Direct Spend"
+                rationale = "Low referral share/multiplier suggests direct efficiency dominates."
+            strategy_summary = {
+                "Direct_Leads": direct_leads,
+                "Referral_Leads": referral_leads,
+                "Referral_Share": referral_share,
+                "Referral_Multiplier": rm,
+                "System_CPR": system_cpr,
+                "Direct_CPL": direct_cpl,
+                "Recommendation": recommendation,
+                "Rationale": rationale
+            }
+
+        allocation_by_builder = pd.DataFrame()
+        if not allocations_df.empty and not dest_shares.empty:
+            expanded = allocations_df.merge(dest_shares, on=ad_col, how="left")
+            expanded["spend_to_builder"] = expanded["spend"] * expanded["share"]
+            expanded["expected_leads"] = expanded["spend"] * expanded["leads_per_dollar"] * expanded["share"]
+            allocation_by_builder = (
+                expanded.groupby([ad_col, dest_col])
+                .agg(
+                    spend=("spend_to_builder", "sum"),
+                    expected_leads=("expected_leads", "sum"),
+                    share=("share", "mean"),
+                )
+                .reset_index()
+                .sort_values("spend", ascending=False)
+            )
 
         # Build expected delivery by day
         delivery_rows = []
         spend_schedule_rows = []
         expected_by_builder = {}
-        max_lag_days = min(30, horizon_days)
         if not allocations_df.empty:
             date_index = pd.date_range(start_date, horizon_end, freq="D")
             avg_dest_per_ad = (
@@ -1050,16 +1331,16 @@ class ReferralOptimizationEngine:
             est_schedule_rows = int(len(allocations_df) * len(date_index))
             if est_delivery_rows > max_delivery_rows:
                 delivery_rows = None
-                notes.append("Skipped expected-delivery detail due to size. Reduce horizon or sources.")
+                notes.append("Skipped daily expected-delivery detail due to size. Weekly delivery still provided.")
             if est_schedule_rows > max_schedule_rows:
                 spend_schedule_rows = None
-                notes.append("Skipped spend schedule detail due to size. Reduce horizon or sources.")
+                notes.append("Skipped daily spend schedule detail due to size. Weekly schedule still provided.")
             for _, alloc in allocations_df.iterrows():
                 ad_key = alloc["ad_key"]
                 spend = alloc["spend"]
                 lpd = alloc["leads_per_dollar"]
                 spend_per_day = spend / max(len(date_index), 1)
-                curve = self._build_lag_curve(ad_key, max_lag_days=max_lag_days)
+                curve = get_lag_curve(ad_key)
                 share_df = dest_shares[dest_shares[ad_col] == ad_key].sort_values("share", ascending=False)
                 if max_builders_per_ad and len(share_df) > max_builders_per_ad:
                     share_df = share_df.head(max_builders_per_ad)
@@ -1100,6 +1381,126 @@ class ReferralOptimizationEngine:
                 .reset_index()
             )
 
+        # Weekly aggregation (always produced)
+        weekly_schedule = pd.DataFrame()
+        weekly_delivery = pd.DataFrame()
+        if not allocations_df.empty:
+            n_weeks = int(np.ceil(horizon_days / 7))
+            week_starts = [start_date + pd.Timedelta(days=7 * w) for w in range(n_weeks)]
+            days_in_week = [min(7, max(horizon_days - 7 * w, 0)) for w in range(n_weeks)]
+            week_idx = np.repeat(np.arange(n_weeks), days_in_week)
+
+            weekly_rows = []
+            for _, alloc in allocations_df.iterrows():
+                ad_key = alloc["ad_key"]
+                spend = alloc["spend"]
+                spend_per_day = spend / max(horizon_days, 1)
+                for w, week_start in enumerate(week_starts):
+                    weekly_rows.append({
+                        "week_start": week_start,
+                        "ad_key": ad_key,
+                        "spend": spend_per_day * days_in_week[w]
+                    })
+            weekly_schedule = pd.DataFrame(weekly_rows)
+
+            builder_week = {}
+            for _, alloc in allocations_df.iterrows():
+                ad_key = alloc["ad_key"]
+                spend = alloc["spend"]
+                lpd = alloc["leads_per_dollar"]
+                spend_per_day = spend / max(horizon_days, 1)
+                curve = get_lag_curve(ad_key)
+                daily_expected_total = np.convolve(np.ones(horizon_days), curve)[:horizon_days] * spend_per_day * lpd
+                weekly_expected_total = np.bincount(week_idx, weights=daily_expected_total, minlength=n_weeks)
+                share_df = dest_shares[dest_shares[ad_col] == ad_key].sort_values("share", ascending=False)
+                if max_builders_per_ad and len(share_df) > max_builders_per_ad:
+                    share_df = share_df.head(max_builders_per_ad)
+                for _, srow in share_df.iterrows():
+                    builder = srow[dest_col]
+                    share = srow["share"]
+                    if share <= 0:
+                        continue
+                    if builder not in builder_week:
+                        builder_week[builder] = np.zeros(n_weeks)
+                    builder_week[builder] += weekly_expected_total * share
+
+            delivery_rows_w = []
+            for builder, vals in builder_week.items():
+                for w, week_start in enumerate(week_starts):
+                    if vals[w] <= 0:
+                        continue
+                    delivery_rows_w.append({
+                        "week_start": week_start,
+                        "builder": builder,
+                        "expected_leads": vals[w]
+                    })
+            weekly_delivery = pd.DataFrame(delivery_rows_w)
+
+        # Coverage (pre/post) and unit economics
+        coverage_rows = []
+        total_target = 0.0
+        total_actual = 0.0
+        total_expected = 0.0
+        for _, row in builder_targets_df.iterrows():
+            builder = row["Builder"]
+            target_total = float(row.get("TargetTotal", 0.0))
+            actual_to_date = float(row.get("ActualToDate", 0.0))
+            expected = float(expected_by_builder.get(builder, 0.0))
+            pre_cov = (actual_to_date / target_total) if target_total > 0 else 0.0
+            post_cov = ((actual_to_date + expected) / target_total) if target_total > 0 else 0.0
+            coverage_rows.append({
+                "Builder": builder,
+                "TargetTotal": target_total,
+                "ActualToDate": actual_to_date,
+                "ExpectedFromPlan": expected,
+                "PreCoveragePct": pre_cov,
+                "PostCoveragePct": post_cov,
+                "RemainingGap": max(target_total - actual_to_date - expected, 0.0)
+            })
+            total_target += target_total
+            total_actual += actual_to_date
+            total_expected += expected
+
+        coverage_summary = pd.DataFrame(coverage_rows)
+        coverage_overall = pd.DataFrame([{
+            "Builder": "ALL",
+            "TargetTotal": total_target,
+            "ActualToDate": total_actual,
+            "ExpectedFromPlan": total_expected,
+            "PreCoveragePct": (total_actual / total_target) if total_target > 0 else 0.0,
+            "PostCoveragePct": ((total_actual + total_expected) / total_target) if total_target > 0 else 0.0,
+            "RemainingGap": max(total_target - total_actual - total_expected, 0.0)
+        }])
+        coverage_summary = pd.concat([coverage_summary, coverage_overall], ignore_index=True)
+
+        total_spend_hist = float(self.events[cost_col].sum()) if cost_col in self.events.columns else 0.0
+        total_leads_hist = float(len(self.events))
+        total_ref_hist = float(self.events[self.cols.get("is_referral")].sum()) if self.cols.get("is_referral") in self.events.columns else 0.0
+        pre_cpl = total_spend_hist / total_leads_hist if total_leads_hist > 0 else float("inf")
+        pre_cpr = total_spend_hist / total_ref_hist if total_ref_hist > 0 else float("inf")
+        plan_spend = float(allocations_df["spend"].sum()) if not allocations_df.empty else 0.0
+        plan_expected = float(total_expected)
+        post_cpl = plan_spend / plan_expected if plan_expected > 0 else float("inf")
+        unit_economics = pd.DataFrame([{
+            "Pre_CPL": pre_cpl,
+            "Pre_CPR": pre_cpr,
+            "Post_CPL": post_cpl,
+            "Plan_Spend": plan_spend,
+            "Plan_Expected_Leads": plan_expected
+        }])
+
+        dollar_journey = pd.DataFrame()
+        if not allocation_by_builder.empty:
+            bs = builder_shortfall
+            journey = allocation_by_builder.copy()
+            journey["Shortfall"] = journey[dest_col].map(bs).fillna(0.0)
+            journey["Leakage_Leads"] = (journey["expected_leads"] - journey["Shortfall"]).clip(lower=0.0)
+            journey["Leakage_Pct"] = journey["Leakage_Leads"] / journey["expected_leads"].replace(0, np.nan)
+            journey["Leakage_Pct"] = journey["Leakage_Pct"].fillna(0.0)
+            journey["Effective_CPL"] = journey["spend"] / journey["expected_leads"].replace(0, np.nan)
+            journey["Effective_CPL"] = journey["Effective_CPL"].fillna(float("inf"))
+            dollar_journey = journey.sort_values("spend", ascending=False)
+
         # Leakage summary: referrals to builders without shortfall or excess
         leakage_rows = []
         for builder, expected in expected_by_builder.items():
@@ -1112,14 +1513,70 @@ class ReferralOptimizationEngine:
                     "expected_leads": expected,
                     "shortfall": shortfall
                 })
-        leakage_summary = pd.DataFrame(leakage_rows).sort_values("leakage_leads", ascending=False)
+        leakage_summary = pd.DataFrame(leakage_rows)
+        if not leakage_summary.empty and "leakage_leads" in leakage_summary.columns:
+            leakage_summary = leakage_summary.sort_values("leakage_leads", ascending=False)
+        else:
+            leakage_summary = pd.DataFrame(columns=["builder", "leakage_leads", "expected_leads", "shortfall"])
+
+        # Round lead counts for display/output
+        def _round_leads(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+            if df is None or df.empty:
+                return df
+            for col in cols:
+                if col in df.columns:
+                    df[col] = df[col].round(0)
+            return df
+
+        allocation_by_builder = _round_leads(allocation_by_builder, ["expected_leads"])
+        expected_delivery = _round_leads(expected_delivery, ["expected_leads"])
+        weekly_delivery = _round_leads(weekly_delivery, ["expected_leads"])
+        leakage_summary = _round_leads(leakage_summary, ["leakage_leads", "expected_leads"])
+        coverage_summary = _round_leads(coverage_summary, ["ExpectedFromPlan", "ActualToDate"])
+        unit_economics = _round_leads(unit_economics, ["Plan_Expected_Leads"])
+        dollar_journey = _round_leads(dollar_journey, ["expected_leads", "Leakage_Leads", "Shortfall"])
+
+        run_manifest = {
+            "timestamp": pd.Timestamp.now().isoformat(),
+            "config": {
+                "total_budget": total_budget,
+                "horizon_days": horizon_days,
+                "max_source_share": max_source_share,
+                "lead_target_scale": lead_target_scale,
+                "leakage_cap_pct": leakage_cap_pct,
+                "smoothing_alpha": smoothing_alpha,
+                "min_leads_per_ad": min_leads_per_ad,
+                "min_edge_leads": min_edge_leads,
+                "min_lag_samples": min_lag_samples,
+                "max_builders_per_ad": max_builders_per_ad
+            },
+            "filters": {
+                "active_only": active_only,
+                "include_ad_keys": include_ad_keys or []
+            },
+            "counts": {
+                "events_total": int(len(self.events)),
+                "events_used": int(len(events)),
+                "ad_keys_used": int(events[ad_col].nunique()) if ad_col in events.columns else 0
+            },
+            "notes": notes
+        }
 
         trace = {
             "builder_targets": builder_targets_df,
+            "pacing_summary": pacing_summary,
+            "strategy_summary": pd.DataFrame([strategy_summary]) if strategy_summary else pd.DataFrame(),
+            "coverage_summary": coverage_summary,
+            "unit_economics": unit_economics,
+            "dollar_journey": dollar_journey,
             "ad_performance": perf,
             "allocation_summary": allocations_df,
+            "allocation_by_builder": allocation_by_builder,
             "destination_shares": dest_shares,
-            "spend_schedule": pd.DataFrame(spend_schedule_rows) if spend_schedule_rows else pd.DataFrame()
+            "spend_schedule": pd.DataFrame(spend_schedule_rows) if spend_schedule_rows else pd.DataFrame(),
+            "spend_schedule_weekly": weekly_schedule,
+            "expected_delivery_weekly": weekly_delivery,
+            "run_manifest": pd.DataFrame([run_manifest])
         }
 
         return FastOptimizationResult(

@@ -1028,7 +1028,7 @@ def main():
             rm_map = (total / direct.replace(0, np.nan)).fillna(1.0).to_dict()
 
         fig = render_network_graph(G, bm, st.session_state.focus_builder, st.session_state.targets, color_mode=color_mode, rm_map=rm_map)
-        st.plotly_chart(fig, width="stretch", config={'displayModeBar': False})
+        st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
     
     with col2:
         # Builder analysis
@@ -1181,13 +1181,13 @@ def main():
             if inbound.empty:
                 st.caption("No inbound referrals in the filtered network.")
             else:
-                st.dataframe(inbound, hide_index=True, width="stretch")
+                st.dataframe(inbound, hide_index=True, use_container_width=True)
         with c_out:
             st.markdown("**Sends referrals to**")
             if outbound.empty:
                 st.caption("No outbound referrals in the filtered network.")
             else:
-                st.dataframe(outbound, hide_index=True, width="stretch")
+                st.dataframe(outbound, hide_index=True, use_container_width=True)
     else:
         st.caption("Select a builder to see inbound and outbound referral relationships.")
 
@@ -1247,7 +1247,7 @@ def main():
                         "CPR": "CPR"
                     }),
                     hide_index=True,
-                    width="stretch"
+                    use_container_width=True
                 )
             else:
                 st.caption("No campaign fields found for leaderboard (utm_campaign, utm_key, ad_key).")
@@ -1309,7 +1309,7 @@ def main():
                         xaxis_title=None,
                         yaxis_title="Referrals"
                     )
-                    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+                    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
             else:
                 ts = (
                     inbound.groupby(["period", "MediaPayer_BuilderRegionKey"], as_index=False)["LeadId"]
@@ -1340,7 +1340,7 @@ def main():
                     xaxis_title=None,
                     yaxis_title="Referrals"
                 )
-                st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
     else:
         st.caption("Select a builder to see inbound referral flow over time.")
 
@@ -1391,7 +1391,7 @@ def main():
                 .head(15)
             )
             st.markdown("**Top destinations (lifetime, filtered window)**")
-            st.dataframe(leaderboard, hide_index=True, width="stretch")
+            st.dataframe(leaderboard, hide_index=True, use_container_width=True)
 
             ts = (
                 outbound.groupby(["period", "Dest_BuilderRegionKey"], as_index=False)["LeadId"]
@@ -1422,7 +1422,7 @@ def main():
                 xaxis_title=None,
                 yaxis_title="Referrals"
             )
-            st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
     else:
         st.caption("Select a builder to see outbound referral flow over time.")
     
@@ -1640,7 +1640,7 @@ def main():
             unallocated=summary['unallocated']
         )
         if flow_dot:
-            st.graphviz_chart(flow_dot, width="stretch")
+            st.graphviz_chart(flow_dot, use_container_width=True)
         else:
             st.caption("Not enough data to render the flow diagram.")
 

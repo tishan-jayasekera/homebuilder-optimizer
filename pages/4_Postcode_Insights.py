@@ -100,6 +100,15 @@ def load_postcode_geo():
         return None
 
 
+def _is_lfs_pointer(path: Path) -> bool:
+    try:
+        with path.open() as f:
+            first_line = f.readline().strip()
+        return first_line.startswith("version https://git-lfs.github.com/spec/v1")
+    except Exception:
+        return False
+
+
 @st.cache_data(show_spinner=False)
 def load_postcode_meta():
     meta_path = Path("data/PostcodeData-final.txt")
@@ -159,6 +168,9 @@ def main():
 
     geojson_data = load_postcode_geo()
     postcode_meta = load_postcode_meta()
+    geo_path = Path("data/au-postcodes.geojson")
+    if geojson_data is None and geo_path.exists() and _is_lfs_pointer(geo_path):
+        st.warning("Postcode map shapes are missing (Git LFS pointer detected). Run `git lfs pull` or replace data/au-postcodes.geojson with the real file.")
 
     # Sidebar filters
     with st.sidebar:
@@ -1423,6 +1435,7 @@ def main():
         if group.empty:
             st.caption("Not enough data to build benchmarks.")
         else:
+            state_benchmark = None
             if "State" in group.columns and group["State"].notna().any():
                 if spend_col:
                     spend_series = df[spend_col].fillna(0)
@@ -1440,24 +1453,31 @@ def main():
                         Avg_CPR=("_event_spend", lambda s: s.sum() / max(1, len(s)))
                     )
                 )
+
             st.markdown("**State benchmarks**")
-            st.dataframe(
-                state_benchmark.rename(columns={
-                    "Avg_CPR": "Avg CPR"
-                }),
-                hide_index=True
-            )
+            if state_benchmark is None or state_benchmark.empty:
+                st.caption("No state benchmarks available.")
+            else:
+                st.dataframe(
+                    state_benchmark.rename(columns={
+                        "Avg_CPR": "Avg CPR"
+                    }),
+                    hide_index=True
+                )
 
             st.markdown("**Regional composition by state**")
-            comp_df = df[df["State"].notna()].copy()
-            if comp_df.empty:
+            if "State" not in df.columns:
                 st.caption("No state data available for composition.")
             else:
-                finance_col = _find_col(comp_df.columns, ["Finance Status"])
-                timeframe_col = _find_col(comp_df.columns, ["Timeframe"])
-                land_col = _find_col(comp_df.columns, ["Do you have land"])
-                house_col = _find_col(comp_df.columns, ["House type"])
-                beds_col = _find_col(comp_df.columns, ["IBN_Bedrooms"])
+                comp_df = df[df["State"].notna()].copy()
+                if comp_df.empty:
+                    st.caption("No state data available for composition.")
+                else:
+                    finance_col = _find_col(comp_df.columns, ["Finance Status"])
+                    timeframe_col = _find_col(comp_df.columns, ["Timeframe"])
+                    land_col = _find_col(comp_df.columns, ["Do you have land"])
+                    house_col = _find_col(comp_df.columns, ["House type"])
+                    beds_col = _find_col(comp_df.columns, ["IBN_Bedrooms"])
                 budget_col = _find_col(comp_df.columns, ["Budget"])
 
                 def state_share_table(series, label):
