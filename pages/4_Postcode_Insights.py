@@ -1871,8 +1871,25 @@ def main():
         else:
             rpl_col = _find_col(df.columns, ["RPL_from_job"])
             if rpl_col:
-                df[rpl_col] = pd.to_numeric(df[rpl_col], errors="coerce").fillna(0)
-            df["_event_spend"] = df[spend_col].fillna(0) if spend_col else 0
+                df[rpl_col] = pd.to_numeric(df[rpl_col], errors="coerce")
+            if spend_col:
+                df["_event_spend"] = pd.to_numeric(df[spend_col], errors="coerce").fillna(0.0)
+            else:
+                df["_event_spend"] = 0.0
+            if rpl_col:
+                df["_event_revenue"] = df[rpl_col]
+            else:
+                df["_event_revenue"] = np.nan
+
+            def _safe_div(num, denom):
+                return num / denom if denom and denom > 0 else np.nan
+
+            def _fmt(val, fmt="{:,.0f}", empty="—"):
+                if val is None:
+                    return empty
+                if isinstance(val, (float, np.floating)) and (np.isnan(val) or np.isinf(val)):
+                    return empty
+                return fmt.format(val)
 
             st.markdown("**Performance trends**")
             trend_freq = st.radio("Trend period", ["Weekly", "Monthly"], horizontal=True, key="campaign_trend_freq")
@@ -1884,7 +1901,7 @@ def main():
                     Spend=("_event_spend", "sum"),
                     Leads=("is_referral_bool", lambda x: (~x).sum()),
                     Referrals=("is_referral_bool", "sum"),
-                    Revenue=(rpl_col, "sum") if rpl_col else ("_event_spend", "sum")
+                    Revenue=("_event_revenue", lambda s: s.sum(min_count=1))
                 )
             )
             ts_campaign["CPR"] = np.where(
@@ -2020,7 +2037,7 @@ def main():
                     Spend=("_event_spend", "sum"),
                     Leads=("is_referral_bool", lambda x: (~x).sum()),
                     Referrals=("is_referral_bool", "sum"),
-                    Revenue=(rpl_col, "sum") if rpl_col else ("_event_spend", "sum")
+                    Revenue=("_event_revenue", lambda s: s.sum(min_count=1))
                 )
             )
             camp_perf["CPR"] = np.where(
@@ -2050,25 +2067,53 @@ def main():
             if c_df.empty:
                 st.caption("No activity for this campaign.")
             else:
+                lead_events = c_df[c_df["is_referral_bool"] == False]
+                ref_events = c_df[c_df["is_referral_bool"] == True]
+                lead_spend = float(lead_events["_event_spend"].sum())
+                ref_spend = float(ref_events["_event_spend"].sum())
                 camp_kpis = {
-                    "Spend": c_df["_event_spend"].sum(),
-                    "Leads": (~c_df["is_referral_bool"]).sum(),
-                    "Referrals": c_df["is_referral_bool"].sum(),
-                    "Revenue": c_df[rpl_col].sum() if rpl_col else 0
+                    "Spend": float(c_df["_event_spend"].sum()),
+                    "Leads": int((~c_df["is_referral_bool"]).sum()),
+                    "Referrals": int(c_df["is_referral_bool"].sum()),
+                    "Revenue": float(c_df["_event_revenue"].sum(min_count=1))
                 }
-                camp_kpis["CPR"] = camp_kpis["Spend"] / max(1, camp_kpis["Leads"] + camp_kpis["Referrals"])
-                camp_kpis["Revenue / Event"] = camp_kpis["Revenue"] / max(1, camp_kpis["Leads"] + camp_kpis["Referrals"])
-                camp_kpis["ROAS"] = camp_kpis["Revenue"] / max(1, camp_kpis["Spend"])
+                events_total = camp_kpis["Leads"] + camp_kpis["Referrals"]
+                camp_kpis["Events"] = events_total
+                camp_kpis["CPR"] = _safe_div(camp_kpis["Spend"], events_total)
+                camp_kpis["CPL"] = _safe_div(lead_spend, camp_kpis["Leads"])
+                camp_kpis["CPR_referral"] = _safe_div(ref_spend, camp_kpis["Referrals"])
+                camp_kpis["Referral Rate"] = _safe_div(camp_kpis["Referrals"], camp_kpis["Leads"])
+                camp_kpis["Revenue / Event"] = _safe_div(camp_kpis["Revenue"], events_total)
+                camp_kpis["ROAS"] = _safe_div(camp_kpis["Revenue"], camp_kpis["Spend"])
                 st.markdown(f"""
                 <div class="kpi-row">
-                    <div class="kpi"><div class="kpi-label">Spend</div><div class="kpi-value">${camp_kpis["Spend"]:,.0f}</div></div>
-                    <div class="kpi"><div class="kpi-label">Leads</div><div class="kpi-value">{camp_kpis["Leads"]:,.0f}</div></div>
-                    <div class="kpi"><div class="kpi-label">Referrals</div><div class="kpi-value">{camp_kpis["Referrals"]:,.0f}</div></div>
-                    <div class="kpi"><div class="kpi-label">CPR</div><div class="kpi-value">${camp_kpis["CPR"]:,.0f}</div></div>
-                    <div class="kpi"><div class="kpi-label">Revenue / Event</div><div class="kpi-value">${camp_kpis["Revenue / Event"]:,.0f}</div></div>
-                    <div class="kpi"><div class="kpi-label">ROAS</div><div class="kpi-value">{camp_kpis["ROAS"]:.1f}x</div></div>
+                    <div class="kpi"><div class="kpi-label">Spend</div><div class="kpi-value">${_fmt(camp_kpis["Spend"])}</div></div>
+                    <div class="kpi"><div class="kpi-label">Leads</div><div class="kpi-value">{_fmt(camp_kpis["Leads"])}</div></div>
+                    <div class="kpi"><div class="kpi-label">Referrals</div><div class="kpi-value">{_fmt(camp_kpis["Referrals"])}</div></div>
+                    <div class="kpi"><div class="kpi-label">Events</div><div class="kpi-value">{_fmt(camp_kpis["Events"])}</div></div>
+                    <div class="kpi"><div class="kpi-label">CPR (per event)</div><div class="kpi-value">${_fmt(camp_kpis["CPR"])}</div></div>
+                    <div class="kpi"><div class="kpi-label">CPL (lead)</div><div class="kpi-value">${_fmt(camp_kpis["CPL"])}</div></div>
+                    <div class="kpi"><div class="kpi-label">CPR (referral)</div><div class="kpi-value">${_fmt(camp_kpis["CPR_referral"])}</div></div>
+                    <div class="kpi"><div class="kpi-label">Referral Rate</div><div class="kpi-value">{_fmt(camp_kpis["Referral Rate"], fmt="{:.0%}")}</div></div>
+                    <div class="kpi"><div class="kpi-label">Revenue / Event</div><div class="kpi-value">${_fmt(camp_kpis["Revenue / Event"])}</div></div>
+                    <div class="kpi"><div class="kpi-label">ROAS</div><div class="kpi-value">{_fmt(camp_kpis["ROAS"], fmt="{:.1f}x")}</div></div>
                 </div>
                 """, unsafe_allow_html=True)
+                if not rpl_col:
+                    st.caption("Revenue metrics require RPL_from_job. Revenue/ROAS are blank when unavailable.")
+                st.markdown("**Spend trace (leads vs referrals)**")
+                trace_df = pd.DataFrame({
+                    "Metric": ["Lead Spend", "Referral Spend", "Total Spend", "Leads", "Referrals", "Events"],
+                    "Value": [
+                        lead_spend,
+                        ref_spend,
+                        camp_kpis["Spend"],
+                        camp_kpis["Leads"],
+                        camp_kpis["Referrals"],
+                        camp_kpis["Events"]
+                    ]
+                })
+                st.dataframe(trace_df, hide_index=True, use_container_width=True)
 
                 c_ts = (
                     c_df.assign(period=c_df["event_date"].dt.to_period(trend_period).dt.start_time)
@@ -2077,7 +2122,7 @@ def main():
                         Spend=("_event_spend", "sum"),
                         Leads=("is_referral_bool", lambda x: (~x).sum()),
                         Referrals=("is_referral_bool", "sum"),
-                        Revenue=(rpl_col, "sum") if rpl_col else ("_event_spend", "sum")
+                        Revenue=("_event_revenue", lambda s: s.sum(min_count=1))
                     )
                 )
                 c_ts["CPR"] = np.where(
