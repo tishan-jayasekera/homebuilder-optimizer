@@ -367,7 +367,8 @@ def main():
         "4) Benchmarks",
         "5) Optimization",
         "6) Overlap",
-        "7) Creative"
+        "7) Creative",
+        "8) Low Referrals"
     ])
 
     with tabs[0]:
@@ -2141,6 +2142,279 @@ def main():
                 .rename(columns={campaign_col: "Campaign"}),
                 hide_index=True
             )
+
+    with tabs[7]:
+        st.markdown("""
+        <div class="section-card">
+            <div class="section-header">
+                <span class="section-num">8</span>
+                <span class="section-title">Low Referral Postcodes & Builder Leverage</span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        st.markdown("""
+        <div class="explainer">
+            <div class="explainer-title">What this tab does</div>
+            <div class="explainer-text">
+                Identify postcodes with weak referral penetration, see which builders overlap there, review the historic lead mix,
+                and surface the campaigns driving those postcodes. You can also pick a builder to find which low-referral postcodes
+                to leverage and which other builders would benefit from improvements.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if group.empty:
+            st.caption("Not enough data to build low-referral diagnostics.")
+        else:
+            postcode_key = "Postcode" if "Postcode" in group.columns else postcode_col
+            suburb_key = "Suburb" if "Suburb" in group.columns else suburb_col
+
+            postcode_stats = (
+                group.groupby(postcode_key, as_index=False)
+                .agg(
+                    Suburbs=(suburb_key, "nunique"),
+                    Leads=("Leads", "sum"),
+                    Referrals=("Referrals", "sum"),
+                    Total_Events=("Total_Events", "sum"),
+                    Campaigns=("Campaigns", "sum"),
+                    Media_Spend=("Media_Spend", "sum")
+                )
+            )
+            postcode_stats["Referral_Rate"] = np.where(
+                postcode_stats["Leads"] > 0,
+                postcode_stats["Referrals"] / postcode_stats["Leads"],
+                0
+            )
+
+            max_leads_val = int(max(1, postcode_stats["Leads"].max()))
+            max_refs_val = int(max(0, postcode_stats["Referrals"].max()))
+
+            c1, c2, c3, c4 = st.columns([1.1, 1, 1, 1])
+            with c1:
+                min_leads_lr = st.slider(
+                    "Min leads (scan)",
+                    1,
+                    max_leads_val,
+                    min(20, max_leads_val),
+                    step=1
+                )
+            with c2:
+                max_rate = st.slider("Max referral rate", 0.0, 0.5, 0.1, step=0.01)
+            with c3:
+                max_refs = st.slider("Max referrals", 0, max_refs_val, min(5, max_refs_val), step=1)
+            with c4:
+                apply_rate = st.checkbox("Filter by rate", value=True, key="lr_filter_rate")
+                apply_count = st.checkbox("Filter by count", value=False, key="lr_filter_count")
+
+            low_mask = postcode_stats["Leads"] >= min_leads_lr
+            if apply_rate:
+                low_mask &= postcode_stats["Referral_Rate"] <= max_rate
+            if apply_count:
+                low_mask &= postcode_stats["Referrals"] <= max_refs
+
+            low_ref = postcode_stats[low_mask].sort_values(
+                ["Referral_Rate", "Leads"],
+                ascending=[True, False]
+            )
+
+            st.markdown("**Low-referral postcodes**")
+            st.dataframe(
+                low_ref.rename(columns={
+                    "Media_Spend": "Ad Spend",
+                    "Referral_Rate": "Referral Rate"
+                }).head(50),
+                hide_index=True,
+                use_container_width=True
+            )
+
+            default_sel = low_ref[postcode_key].head(3).tolist()
+            selected_postcodes = st.multiselect(
+                "Inspect postcodes",
+                low_ref[postcode_key].tolist(),
+                default=default_sel
+            )
+
+            if not selected_postcodes:
+                st.caption("Select one or more postcodes above to see builder overlap, lead profiles, and campaigns.")
+            else:
+                sel_df = df[df[postcode_col].isin(selected_postcodes)].copy()
+
+                st.markdown("**Builder overlap in selected postcodes**")
+                if "Dest_BuilderRegionKey" in sel_df.columns:
+                    builder_breakdown = (
+                        sel_df.groupby("Dest_BuilderRegionKey", as_index=False)
+                        .agg(
+                            Leads=(ref_flag_col, lambda x: (~x).sum()),
+                            Referrals=(ref_flag_col, "sum"),
+                            Events=(ref_flag_col, "size")
+                        )
+                    )
+                    builder_breakdown["Referral Rate"] = np.where(
+                        builder_breakdown["Leads"] > 0,
+                        builder_breakdown["Referrals"] / builder_breakdown["Leads"],
+                        0
+                    )
+                    builder_breakdown = builder_breakdown.sort_values("Events", ascending=False)
+                    st.dataframe(builder_breakdown, hide_index=True, use_container_width=True)
+                else:
+                    st.caption("Builder overlap requires Dest_BuilderRegionKey.")
+
+                st.markdown("**Historical lead profile**")
+                if not sel_df.empty:
+                    ts = (
+                        sel_df.groupby(pd.Grouper(key="event_date", freq="M"))
+                        .agg(
+                            Leads=(ref_flag_col, lambda x: (~x).sum()),
+                            Referrals=(ref_flag_col, "sum")
+                        )
+                        .reset_index()
+                    )
+                    if not ts.empty:
+                        fig_ts = px.line(
+                            ts,
+                            x="event_date",
+                            y=["Leads", "Referrals"],
+                            markers=True,
+                            title="Lead and referral volume over time"
+                        )
+                        fig_ts.update_layout(height=260, margin=dict(l=0, r=0, t=40, b=0), yaxis_title="Volume")
+                        st.plotly_chart(fig_ts, use_container_width=True, config={"displayModeBar": False})
+
+                if "MediaPayer_BuilderRegionKey" in sel_df.columns:
+                    source_breakdown = (
+                        sel_df.groupby("MediaPayer_BuilderRegionKey", as_index=False)
+                        .agg(
+                            Leads=(ref_flag_col, lambda x: (~x).sum()),
+                            Referrals=(ref_flag_col, "sum"),
+                            Events=(ref_flag_col, "size")
+                        )
+                        .sort_values("Events", ascending=False)
+                    )
+                    st.dataframe(source_breakdown, hide_index=True, use_container_width=True)
+                else:
+                    st.caption("Lead source profile requires MediaPayer_BuilderRegionKey.")
+
+                st.markdown("**Campaigns feeding selected postcodes**")
+                if campaign_col:
+                    if "LeadId" in sel_df.columns:
+                        camp = (
+                            sel_df.groupby(campaign_col, as_index=False)["LeadId"]
+                            .nunique()
+                            .rename(columns={"LeadId": "Events"})
+                        )
+                    else:
+                        camp = (
+                            sel_df.groupby(campaign_col, as_index=False)
+                            .size()
+                            .rename(columns={"size": "Events"})
+                        )
+                    if spend_col:
+                        camp_spend = sel_df.groupby(campaign_col, as_index=False)[spend_col].sum()
+                        camp = camp.merge(camp_spend, on=campaign_col, how="left")
+                        camp = camp.rename(columns={spend_col: "Ad Spend"})
+                        camp["CPR"] = np.where(
+                            camp["Events"] > 0,
+                            camp.get("Ad Spend", 0) / camp["Events"],
+                            np.nan
+                        )
+                    camp = camp.sort_values("Events", ascending=False).head(20)
+                    camp = camp.rename(columns={campaign_col: "Campaign"})
+                    st.dataframe(camp, hide_index=True, use_container_width=True)
+                else:
+                    st.caption("Campaign diagnostics require utm_campaign/utm_key/ad_key.")
+
+            st.markdown("---")
+            st.markdown("**Builder leverage view**")
+            if "Dest_BuilderRegionKey" not in df.columns:
+                st.caption("Builder leverage requires Dest_BuilderRegionKey.")
+            else:
+                builder_options = sorted(df["Dest_BuilderRegionKey"].dropna().unique().tolist())
+                selected_builder = st.selectbox("Select builder", [""] + builder_options, key="lr_builder_select")
+                if selected_builder:
+                    builder_df = df[df["Dest_BuilderRegionKey"] == selected_builder].copy()
+                    builder_pc = (
+                        builder_df.groupby(postcode_col, as_index=False)
+                        .agg(
+                            Leads_builder=(ref_flag_col, lambda x: (~x).sum()),
+                            Referrals_builder=(ref_flag_col, "sum"),
+                            Events_builder=(ref_flag_col, "size")
+                        )
+                    )
+                    builder_pc["Referral_Rate_builder"] = np.where(
+                        builder_pc["Leads_builder"] > 0,
+                        builder_pc["Referrals_builder"] / builder_pc["Leads_builder"],
+                        0
+                    )
+                    builder_pc["Opportunity_Score"] = (
+                        (1 - builder_pc["Referral_Rate_builder"]) * builder_pc["Leads_builder"]
+                    )
+                    builder_pc = builder_pc.merge(
+                        postcode_stats[[postcode_key, "Leads", "Referrals", "Campaigns"]],
+                        left_on=postcode_col,
+                        right_on=postcode_key,
+                        how="left",
+                        suffixes=("", "_total")
+                    )
+                    builder_pc = builder_pc.rename(columns={
+                        "Leads": "Leads_total",
+                        "Referrals": "Referrals_total"
+                    })
+                    builder_pc = builder_pc[builder_pc["Leads_builder"] >= min_leads_lr].copy()
+                    if apply_rate:
+                        builder_pc = builder_pc[builder_pc["Referral_Rate_builder"] <= max_rate]
+                    if apply_count:
+                        builder_pc = builder_pc[builder_pc["Referrals_builder"] <= max_refs]
+
+                    other_map = {}
+                    other_count_map = {}
+                    if not builder_pc.empty:
+                        pcodes = builder_pc[postcode_col].dropna().unique().tolist()
+                        other = df[
+                            (df[postcode_col].isin(pcodes)) &
+                            (df["Dest_BuilderRegionKey"].notna()) &
+                            (df["Dest_BuilderRegionKey"] != selected_builder)
+                        ]
+                        if not other.empty:
+                            other_counts = (
+                                other.groupby([postcode_col, "Dest_BuilderRegionKey"], as_index=False)
+                                .size()
+                                .rename(columns={"size": "Events"})
+                                .sort_values([postcode_col, "Events"], ascending=[True, False])
+                            )
+                            top_other = other_counts.groupby(postcode_col).head(3)
+                            other_map = top_other.groupby(postcode_col).apply(
+                                lambda g: ", ".join(
+                                    f"{row['Dest_BuilderRegionKey']} ({int(row['Events'])})"
+                                    for _, row in g.iterrows()
+                                )
+                            ).to_dict()
+                            other_count_map = (
+                                other_counts.groupby(postcode_col)["Dest_BuilderRegionKey"]
+                                .nunique()
+                                .to_dict()
+                            )
+
+                    builder_pc["Other Builders"] = builder_pc[postcode_col].map(other_map).fillna("")
+                    builder_pc["Other Builder Count"] = (
+                        builder_pc[postcode_col].map(other_count_map).fillna(0).astype(int)
+                    )
+                    builder_pc = builder_pc.sort_values("Opportunity_Score", ascending=False)
+
+                    st.dataframe(
+                        builder_pc.rename(columns={
+                            postcode_col: "Postcode",
+                            "Leads_builder": "Builder Leads",
+                            "Referrals_builder": "Builder Referrals",
+                            "Events_builder": "Builder Events",
+                            "Referral_Rate_builder": "Builder Referral Rate",
+                            "Leads_total": "Total Leads",
+                            "Referrals_total": "Total Referrals"
+                        }).head(30),
+                        hide_index=True,
+                        use_container_width=True
+                    )
+                else:
+                    st.caption("Select a builder to see which low-referral postcodes to leverage.")
 
     st.markdown("""
     <div class="insight">
