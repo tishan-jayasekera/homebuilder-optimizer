@@ -2068,12 +2068,28 @@ def main():
                 value=True,
                 key="campaign_unique_counts"
             )
-            lead_id_col = _find_col(df.columns, ["LeadId", "lead_id", "LeadID"])
-            parent_id_col = _find_col(
+            auto_lead_col = _find_col(df.columns, ["LeadId", "lead_id", "LeadID"])
+            auto_parent_col = _find_col(
                 df.columns,
                 ["ParentLeadId", "Parent_LeadId", "ParentLeadID", "ReferrerLeadId", "Referrer_LeadId",
                  "RefLeadId", "ParentLead", "ReferrerLead"]
             )
+            cols_list = sorted(df.columns.tolist())
+            with st.expander("Reconciliation column mapping", expanded=False):
+                lead_choice = st.selectbox(
+                    "Lead ID column",
+                    ["(auto)"] + cols_list,
+                    index=(["(auto)"] + cols_list).index(auto_lead_col) if auto_lead_col in cols_list else 0,
+                    key="campaign_lead_col_choice"
+                )
+                parent_choice = st.selectbox(
+                    "Parent lead column",
+                    ["(auto)"] + cols_list,
+                    index=(["(auto)"] + cols_list).index(auto_parent_col) if auto_parent_col in cols_list else 0,
+                    key="campaign_parent_col_choice"
+                )
+            lead_id_col = auto_lead_col if lead_choice == "(auto)" else lead_choice
+            parent_id_col = auto_parent_col if parent_choice == "(auto)" else parent_choice
             c_df = df[df[campaign_col] == campaign_pick].copy()
             if c_df.empty:
                 st.caption("No activity for this campaign.")
