@@ -2400,6 +2400,23 @@ def main():
                     )
                     builder_pc = builder_pc.sort_values("Opportunity_Score", ascending=False)
 
+                    # Summary KPIs
+                    kpi_postcodes = int(builder_pc[postcode_col].nunique()) if not builder_pc.empty else 0
+                    kpi_leads = float(builder_pc["Leads_builder"].sum()) if not builder_pc.empty else 0.0
+                    kpi_refs = float(builder_pc["Referrals_builder"].sum()) if not builder_pc.empty else 0.0
+                    kpi_ref_rate = (kpi_refs / kpi_leads) if kpi_leads > 0 else 0.0
+                    kpi_overlap = float(builder_pc["Other Builder Count"].mean()) if not builder_pc.empty else 0.0
+
+                    st.markdown(f"""
+                    <div class="kpi-row">
+                        <div class="kpi"><div class="kpi-label">Target Postcodes</div><div class="kpi-value">{kpi_postcodes:,}</div></div>
+                        <div class="kpi"><div class="kpi-label">Builder Leads</div><div class="kpi-value">{kpi_leads:,.0f}</div></div>
+                        <div class="kpi"><div class="kpi-label">Builder Referrals</div><div class="kpi-value">{kpi_refs:,.0f}</div></div>
+                        <div class="kpi"><div class="kpi-label">Referral Rate</div><div class="kpi-value">{kpi_ref_rate:.0%}</div></div>
+                        <div class="kpi"><div class="kpi-label">Avg Overlap</div><div class="kpi-value">{kpi_overlap:.1f}</div></div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
                     st.dataframe(
                         builder_pc.rename(columns={
                             postcode_col: "Postcode",
@@ -2413,6 +2430,90 @@ def main():
                         hide_index=True,
                         use_container_width=True
                     )
+
+                    st.markdown("**Recommended campaigns to leverage**")
+                    if not campaign_col:
+                        st.caption("Campaign leverage requires utm_campaign/utm_key/ad_key.")
+                    else:
+                        camp_df = builder_df[builder_df[postcode_col].isin(builder_pc[postcode_col])].copy()
+                        if camp_df.empty:
+                            st.caption("No campaign data for the selected builder + postcodes.")
+                        else:
+                            camp_summary = (
+                                camp_df.groupby(campaign_col, as_index=False)
+                                .agg(
+                                    Leads=(ref_flag_col, lambda x: (~x).sum()),
+                                    Referrals=(ref_flag_col, "sum"),
+                                    Events=(ref_flag_col, "size"),
+                                    Spend=(spend_col, "sum") if spend_col else (ref_flag_col, "size")
+                                )
+                            )
+                            camp_summary["Referral Rate"] = np.where(
+                                camp_summary["Leads"] > 0,
+                                camp_summary["Referrals"] / camp_summary["Leads"],
+                                0
+                            )
+                            denom = camp_summary["Leads"] + camp_summary["Referrals"]
+                            camp_summary["CPR"] = np.where(
+                                denom > 0,
+                                camp_summary["Spend"] / denom,
+                                np.nan
+                            )
+                            camp_lead_median = camp_summary["Leads"].median() if camp_summary["Leads"].notna().any() else 0
+                            camp_ref_median = camp_summary["Referral Rate"].median() if camp_summary["Referral Rate"].notna().any() else 0
+
+                            def camp_action(row):
+                                high_conv = row["Referral Rate"] >= camp_ref_median
+                                high_vol = row["Leads"] >= camp_lead_median
+                                if high_conv and high_vol:
+                                    return "Scale"
+                                if (not high_conv) and high_vol:
+                                    return "Fix"
+                                if high_conv and (not high_vol):
+                                    return "Test"
+                                return "Deprioritize"
+
+                            camp_summary["Action"] = camp_summary.apply(camp_action, axis=1)
+                            order_map = {"Scale": 0, "Fix": 1, "Test": 2, "Deprioritize": 3}
+                            camp_summary["_order"] = camp_summary["Action"].map(order_map).fillna(9)
+                            camp_summary = camp_summary.sort_values(["_order", "Events"], ascending=[True, False]).drop(columns=["_order"])
+                            camp_summary = camp_summary.rename(columns={campaign_col: "Campaign"})
+                            st.dataframe(
+                                camp_summary[["Campaign", "Events", "Leads", "Referrals", "Referral Rate", "CPR", "Action"]].head(20),
+                                hide_index=True,
+                                use_container_width=True
+                            )
+
+                    st.markdown("**Overflow to other builders (payer spillover)**")
+                    if "MediaPayer_BuilderRegionKey" not in df.columns:
+                        st.caption("Overflow view requires MediaPayer_BuilderRegionKey.")
+                    else:
+                        payer_df = df[
+                            (df["MediaPayer_BuilderRegionKey"] == selected_builder) &
+                            (df[postcode_col].isin(builder_pc[postcode_col]))
+                        ].copy()
+                        if payer_df.empty:
+                            st.caption("No payer-side events for this builder in the selected postcodes.")
+                        else:
+                            spill = (
+                                payer_df.groupby("Dest_BuilderRegionKey", as_index=False)
+                                .agg(
+                                    Events=(ref_flag_col, "size"),
+                                    Referrals=(ref_flag_col, "sum")
+                                )
+                                .sort_values("Events", ascending=False)
+                            )
+                            total_events = spill["Events"].sum()
+                            spill["Share"] = np.where(total_events > 0, spill["Events"] / total_events, 0)
+                            spill = spill[spill["Dest_BuilderRegionKey"] != selected_builder]
+                            if spill.empty:
+                                st.caption("Spillover is mostly retained by the selected builder.")
+                            else:
+                                st.dataframe(
+                                    spill.rename(columns={"Dest_BuilderRegionKey": "Beneficiary Builder"}),
+                                    hide_index=True,
+                                    use_container_width=True
+                                )
                 else:
                     st.caption("Select a builder to see which low-referral postcodes to leverage.")
 
