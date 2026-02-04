@@ -11,6 +11,7 @@ import plotly.express as px
 import html
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
+from io import BytesIO
 import sys
 import subprocess
 from pathlib import Path
@@ -1757,9 +1758,103 @@ def main():
                     'Targets Served': ', '.join(alloc.targets_served),
                     'Synergy Factor': alloc.synergy_factor
                 })
-            
-            csv = pd.DataFrame(export_data).to_csv(index=False)
-            st.download_button("📥 Download Allocation Plan", csv, "allocation_plan.csv", "text/csv")
+            alloc_df = pd.DataFrame(export_data)
+
+            # Build target strategy export
+            target_alloc = {t: {"leads": 0.0, "spend": 0.0, "sources": set()} for t in targets}
+            for alloc in allocations:
+                total_leads = sum(alloc.projected_leads.values())
+                if total_leads <= 0:
+                    continue
+                for target, leads in alloc.projected_leads.items():
+                    if target not in target_alloc:
+                        continue
+                    target_alloc[target]["leads"] += leads
+                    target_alloc[target]["spend"] += alloc.budget * (leads / total_leads)
+                    target_alloc[target]["sources"].add(alloc.source)
+
+            def _campaign_recommendations(df, target, campaign_col):
+                if df is None or df.empty or not campaign_col:
+                    return ""
+                if "Dest_BuilderRegionKey" not in df.columns or "MediaPayer_BuilderRegionKey" not in df.columns:
+                    return ""
+                mask_referral = df["is_referral"].fillna(False).astype(bool) if "is_referral" in df.columns else pd.Series(False, index=df.index)
+                mask_cross_payer = (
+                    df["MediaPayer_BuilderRegionKey"].notna() &
+                    df["Dest_BuilderRegionKey"].notna() &
+                    (df["MediaPayer_BuilderRegionKey"] != df["Dest_BuilderRegionKey"])
+                )
+                inbound = df[
+                    (mask_referral | mask_cross_payer) &
+                    (df["Dest_BuilderRegionKey"] == target)
+                ].copy()
+                if inbound.empty:
+                    return ""
+                inbound["Campaign"] = inbound[campaign_col].fillna("Unknown")
+                ref_col = "LeadId" if "LeadId" in inbound.columns else None
+                if ref_col:
+                    grouped = inbound.groupby("Campaign", as_index=False).agg(Referrals=(ref_col, "nunique"))
+                else:
+                    grouped = inbound.groupby("Campaign", as_index=False).size().rename(columns={"size": "Referrals"})
+                if "MediaCost_referral_event" in inbound.columns:
+                    spend = inbound.groupby("Campaign", as_index=False)["MediaCost_referral_event"].sum()
+                    grouped = grouped.merge(spend, on="Campaign", how="left").rename(columns={"MediaCost_referral_event": "Ad_Spend"})
+                    grouped["CPR"] = np.where(
+                        grouped["Referrals"] > 0,
+                        grouped["Ad_Spend"] / grouped["Referrals"],
+                        np.nan
+                    )
+                grouped = grouped.sort_values("Referrals", ascending=False).head(3)
+                parts = []
+                for _, row in grouped.iterrows():
+                    name = str(row["Campaign"])
+                    refs = int(row.get("Referrals", 0))
+                    cpr = row.get("CPR", np.nan)
+                    if pd.notna(cpr):
+                        parts.append(f"{name} ({refs} refs, ${cpr:,.0f} CPR)")
+                    else:
+                        parts.append(f"{name} ({refs} refs)")
+                return "; ".join(parts)
+
+            strategy_rows = []
+            for target in targets:
+                analysis = target_analyses.get(target)
+                if not analysis:
+                    continue
+                coverage = summary.get("target_coverage", {}).get(target, 0)
+                shortfall = analysis.shortfall
+                projected_leads = target_alloc.get(target, {}).get("leads", 0.0)
+                projected_spend = target_alloc.get(target, {}).get("spend", 0.0)
+                projected_cpr = projected_spend / projected_leads if projected_leads > 0 else np.nan
+                best_path = analysis.best_path
+                strategy_rows.append({
+                    "Target Builder": target,
+                    "Strategy": analysis.recommendation.title().replace("_", " "),
+                    "Best Path Type": best_path.path_type if best_path else "",
+                    "Best Source Builder": best_path.source if best_path else "",
+                    "Best Eff. CPR": best_path.effective_cpr if best_path else np.nan,
+                    "Direct Eff. CPR": analysis.direct_cpr if analysis.direct_cpr is not None else np.nan,
+                    "Network Eff. CPR": analysis.network_cpr if analysis.network_cpr is not None else np.nan,
+                    "Shortfall (Leads)": shortfall,
+                    "Projected Leads": projected_leads,
+                    "Projected Spend": projected_spend,
+                    "Projected Yield CPR": projected_cpr,
+                    "Coverage %": coverage,
+                    "Recommended Campaigns": _campaign_recommendations(events_filtered, target, event_campaign_col),
+                    "Sources In Plan": ", ".join(sorted(target_alloc.get(target, {}).get("sources", set())))
+                })
+            strategy_df = pd.DataFrame(strategy_rows)
+
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+                alloc_df.to_excel(writer, index=False, sheet_name="Allocation Plan")
+                strategy_df.to_excel(writer, index=False, sheet_name="Target Strategy")
+            st.download_button(
+                "📥 Download Optimization Plan",
+                output.getvalue(),
+                "optimization_plan.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
 
         # Flow diagram
         st.markdown("---")
