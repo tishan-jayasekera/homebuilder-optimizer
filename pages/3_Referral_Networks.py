@@ -916,6 +916,53 @@ def main():
             events.columns,
             ["ad_key", "utm_key", "utm_campaign", "Campaign", "campaign"]
         )
+        payer_col = _find_col(
+            events.columns,
+            ["MediaPayer_BuilderRegionKey", "MediaPayerBuilderRegionKey", "MediaPayer"]
+        )
+        paused_campaigns = set()
+        paused_campaigns_ready = False
+        paused_campaigns_error = None
+        paused_payer_builders = []
+        media_ad_col = None
+        media_status_col = None
+        if media_raw is not None and not media_raw.empty:
+            media_ad_col = _find_col(
+                media_raw.columns,
+                ["ad_key", "Ad: Ad name", "ad_name", "utm_key", "utm_campaign", "Campaign", "campaign", "campaign_name", "Campaign name"]
+            )
+            media_status_col = _find_col(
+                media_raw.columns,
+                ["effective_status", "Effective_Status", "status", "Status"]
+            )
+            if media_ad_col and media_status_col:
+                statuses = media_raw[media_status_col].fillna("").astype(str).str.strip().str.upper()
+                paused_mask = statuses.isin({"PAUSED", "CAMPAIGN_PAUSED"})
+                paused_campaigns = set(
+                    media_raw.loc[paused_mask, media_ad_col]
+                    .dropna()
+                    .astype(str)
+                    .str.strip()
+                    .tolist()
+                )
+                paused_campaigns_ready = True
+                if paused_campaigns and event_campaign_col and payer_col:
+                    paused_payer_builders = (
+                        events.loc[
+                            events[event_campaign_col].astype(str).str.strip().isin(paused_campaigns),
+                            payer_col
+                        ]
+                        .dropna()
+                        .astype(str)
+                        .str.strip()
+                        .unique()
+                        .tolist()
+                    )
+            else:
+                paused_campaigns_error = "Media file missing effective_status or ad key."
+        else:
+            paused_campaigns_error = "No media file uploaded."
+
         exclude_paused_campaigns = st.checkbox(
             "Exclude PAUSED campaigns (media effective_status)",
             key="exclude_paused_campaigns",
@@ -923,72 +970,33 @@ def main():
             help="Filters out campaigns with effective_status = PAUSED or CAMPAIGN_PAUSED from media_raw_base_phase0."
         )
         if exclude_paused_campaigns:
-            if media_raw is None or media_raw.empty:
-                st.warning("Paused-campaign filter enabled but no media file uploaded.")
+            if paused_campaigns_error:
+                st.warning(f"Paused-campaign filter enabled but {paused_campaigns_error.lower()}")
+            elif not event_campaign_col:
+                st.warning("Paused-campaign filter enabled but events missing campaign key (ad_key/utm_key/utm_campaign).")
+            elif not paused_campaigns_ready:
+                st.warning("Paused-campaign filter enabled but paused status could not be derived.")
             else:
-                media_ad_col = _find_col(
-                    media_raw.columns,
-                    ["ad_key", "Ad: Ad name", "ad_name", "utm_key", "utm_campaign", "Campaign", "campaign", "campaign_name", "Campaign name"]
-                )
-                media_status_col = _find_col(
-                    media_raw.columns,
-                    ["effective_status", "Effective_Status", "status", "Status"]
-                )
-                if not media_ad_col or not media_status_col:
-                    st.warning("Paused-campaign filter enabled but media file missing effective_status or ad key.")
-                elif not event_campaign_col:
-                    st.warning("Paused-campaign filter enabled but events missing campaign key (ad_key/utm_key/utm_campaign).")
-                else:
-                    statuses = media_raw[media_status_col].fillna("").astype(str).str.strip().str.upper()
-                    paused_mask = statuses.isin({"PAUSED", "CAMPAIGN_PAUSED"})
-                    paused_campaigns = set(
-                        media_raw.loc[paused_mask, media_ad_col]
-                        .dropna()
+                if paused_campaigns:
+                    before = len(events_filtered)
+                    events_filtered = events_filtered[
+                        ~events_filtered[event_campaign_col]
                         .astype(str)
                         .str.strip()
-                        .tolist()
+                        .isin(paused_campaigns)
+                    ]
+                    st.caption(
+                        f"Excluded {before - len(events_filtered):,} events from {len(paused_campaigns):,} paused campaigns."
                     )
-                    if paused_campaigns:
-                        before = len(events_filtered)
-                        events_filtered = events_filtered[
-                            ~events_filtered[event_campaign_col]
-                            .astype(str)
-                            .str.strip()
-                            .isin(paused_campaigns)
-                        ]
-                        st.caption(
-                            f"Excluded {before - len(events_filtered):,} events from {len(paused_campaigns):,} paused campaigns."
-                        )
-                    else:
-                        st.caption("No paused campaigns found in media file.")
+                else:
+                    st.caption("No paused campaigns found in media file.")
         
         builder_options = sorted(set(
             events_filtered["MediaPayer_BuilderRegionKey"].dropna().unique().tolist() +
             events_filtered["Dest_BuilderRegionKey"].dropna().unique().tolist()
         ))
 
-        status_col = _find_col(events_filtered.columns, ["STATUS", "Status", "status"])
-        default_excluded = []
-        if status_col:
-            status_series = events_filtered[status_col].fillna("").astype(str).str.strip().str.lower()
-            status_mask = status_series.isin({"paused", "early exit"})
-            builder_cols = []
-            for c in [
-                "BuilderRegionKey",
-                "Dest_BuilderRegionKey",
-                "MediaPayer_BuilderRegionKey",
-                "Origin_BuilderRegionKey",
-            ]:
-                col = _find_col(events_filtered.columns, [c])
-                if col and col not in builder_cols:
-                    builder_cols.append(col)
-            if builder_cols:
-                values = []
-                for col in builder_cols:
-                    values.extend(
-                        events_filtered.loc[status_mask, col].dropna().astype(str).tolist()
-                    )
-                default_excluded = sorted(set(values))
+        default_excluded = sorted(set(paused_payer_builders))
         if "excluded_builders_initialized" not in st.session_state:
             st.session_state["excluded_builders"] = [b for b in default_excluded if b in builder_options]
             st.session_state["excluded_builders_initialized"] = True
@@ -1011,9 +1019,9 @@ def main():
             st.session_state.optimization_result = None
 
         st.checkbox(
-            "Auto-sync exclusions from STATUS",
+            "Auto-sync exclusions from paused campaigns",
             key="excluded_builders_autosync",
-            help="When enabled, exclusions always follow STATUS = Paused/Early Exit."
+            help="When enabled, exclusions follow media effective_status = PAUSED/CAMPAIGN_PAUSED (payer builders)."
         )
         if st.session_state["excluded_builders_autosync"]:
             _sync_excluded()
@@ -1025,7 +1033,7 @@ def main():
             help="Removes selected builders from the network graph and clustering."
         )
         if not st.session_state["excluded_builders_autosync"]:
-            st.button("Reset exclusions to STATUS defaults", on_click=_sync_excluded)
+            st.button("Reset exclusions to paused defaults", on_click=_sync_excluded)
         if excluded:
             chips = "".join(f"<span class='chip'>{html.escape(b)}</span>" for b in excluded)
             st.markdown(f"<div class='chip-row'>{chips}</div>", unsafe_allow_html=True)
