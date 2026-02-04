@@ -2063,6 +2063,17 @@ def main():
                 sorted(df[campaign_col].dropna().unique().tolist()),
                 key="campaign_tracker_pick"
             )
+            use_unique_ids = st.checkbox(
+                "Count unique LeadId (recommended)",
+                value=True,
+                key="campaign_unique_counts"
+            )
+            lead_id_col = _find_col(df.columns, ["LeadId", "lead_id", "LeadID"])
+            parent_id_col = _find_col(
+                df.columns,
+                ["ParentLeadId", "Parent_LeadId", "ParentLeadID", "ReferrerLeadId", "Referrer_LeadId",
+                 "RefLeadId", "ParentLead", "ReferrerLead"]
+            )
             c_df = df[df[campaign_col] == campaign_pick].copy()
             if c_df.empty:
                 st.caption("No activity for this campaign.")
@@ -2071,13 +2082,23 @@ def main():
                 ref_events = c_df[c_df["is_referral_bool"] == True]
                 lead_spend = float(lead_events["_event_spend"].sum())
                 ref_spend = float(ref_events["_event_spend"].sum())
+                def _count_rows(df_in, flag_val=None):
+                    if use_unique_ids and lead_id_col and lead_id_col in df_in.columns:
+                        if flag_val is None:
+                            return int(df_in[lead_id_col].nunique())
+                        mask = df_in["is_referral_bool"] == flag_val
+                        return int(df_in.loc[mask, lead_id_col].nunique())
+                    if flag_val is None:
+                        return int(len(df_in))
+                    return int((df_in["is_referral_bool"] == flag_val).sum())
                 camp_kpis = {
                     "Spend": float(c_df["_event_spend"].sum()),
-                    "Leads": int((~c_df["is_referral_bool"]).sum()),
-                    "Referrals": int(c_df["is_referral_bool"].sum()),
+                    "Leads": _count_rows(c_df, False),
+                    "Referrals": _count_rows(c_df, True),
                     "Revenue": float(c_df["_event_revenue"].sum(min_count=1))
                 }
                 events_total = camp_kpis["Leads"] + camp_kpis["Referrals"]
+                unique_events = int(c_df[lead_id_col].nunique()) if use_unique_ids and lead_id_col else int(len(c_df))
                 camp_kpis["Events"] = events_total
                 camp_kpis["CPR"] = _safe_div(camp_kpis["Spend"], events_total)
                 camp_kpis["CPL"] = _safe_div(lead_spend, camp_kpis["Leads"])
@@ -2114,14 +2135,6 @@ def main():
                     ]
                 })
                 st.dataframe(trace_df, hide_index=True, use_container_width=True)
-
-                # Reconcile leads to referrals via parent linkage (if available)
-                lead_id_col = _find_col(df.columns, ["LeadId", "lead_id", "LeadID"])
-                parent_id_col = _find_col(
-                    df.columns,
-                    ["ParentLeadId", "Parent_LeadId", "ParentLeadID", "ReferrerLeadId", "Referrer_LeadId",
-                     "RefLeadId", "ParentLead", "ReferrerLead"]
-                )
                 if lead_id_col and parent_id_col:
                     parent_source = df[[lead_id_col, campaign_col, "is_referral_bool"]].dropna(subset=[lead_id_col])
                     lead_parent_source = parent_source[parent_source["is_referral_bool"] == False]
@@ -2133,40 +2146,88 @@ def main():
                     )
                     referrals_all = df[df["is_referral_bool"] == True].copy()
                     referrals_all["_parent_campaign"] = referrals_all[parent_id_col].map(parent_campaign_map)
-                    referrals_from_campaign = int((referrals_all["_parent_campaign"] == campaign_pick).sum())
+                    referrals_from_campaign = referrals_all[referrals_all["_parent_campaign"] == campaign_pick].copy()
+                    referrals_from_campaign_count = (
+                        int(referrals_from_campaign[lead_id_col].nunique())
+                        if use_unique_ids and lead_id_col in referrals_from_campaign.columns
+                        else int(len(referrals_from_campaign))
+                    )
+                    referrals_tagged_campaign = (
+                        int(ref_events[lead_id_col].nunique())
+                        if use_unique_ids and lead_id_col in ref_events.columns
+                        else int(len(ref_events))
+                    )
                     referrals_with_parent = int(referrals_all["_parent_campaign"].notna().sum())
                     total_referrals_all = int(len(referrals_all))
+                    delta_referrals = referrals_tagged_campaign - referrals_from_campaign_count
                     recon_df = pd.DataFrame({
                         "Metric": [
                             "Leads tagged with campaign",
                             "Referrals tagged with campaign",
                             "Referrals generated from campaign leads (parent link)",
+                            "Tagged vs parent-linked delta",
                             "Parent link coverage (all referrals)",
                             "Lead → Referral conversion (parent-linked)"
                         ],
                         "Value": [
                             camp_kpis["Leads"],
-                            camp_kpis["Referrals"],
-                            referrals_from_campaign,
+                            referrals_tagged_campaign,
+                            referrals_from_campaign_count,
+                            delta_referrals,
                             _fmt(_safe_div(referrals_with_parent, total_referrals_all), fmt="{:.0%}"),
-                            _fmt(_safe_div(referrals_from_campaign, camp_kpis["Leads"]), fmt="{:.0%}")
+                            _fmt(_safe_div(referrals_from_campaign_count, camp_kpis["Leads"]), fmt="{:.0%}")
                         ]
                     })
                     st.markdown("**Lead → referral reconciliation**")
                     st.dataframe(recon_df, hide_index=True, use_container_width=True)
+                    if use_unique_ids and unique_events != events_total:
+                        st.caption(f"Unique LeadId count ({unique_events}) does not match Leads+Referrals ({events_total}). Check for lead IDs appearing as both lead and referral.")
+                    if referrals_from_campaign_count > camp_kpis["Leads"] * 5 and camp_kpis["Leads"] > 0:
+                        st.warning("High referrals per lead detected. Inspect parent lead linkage and duplicate rows below.")
+
+                    if not referrals_from_campaign.empty:
+                        top_parents = (
+                            referrals_from_campaign.groupby(parent_id_col, as_index=False)
+                            .agg(
+                                Referrals=(lead_id_col, "nunique") if lead_id_col in referrals_from_campaign.columns else (parent_id_col, "size"),
+                                First_Referral=("event_date", "min"),
+                                Last_Referral=("event_date", "max")
+                            )
+                            .sort_values("Referrals", ascending=False)
+                            .head(20)
+                        )
+                        st.markdown("**Top parent leads driving referrals**")
+                        st.dataframe(top_parents, hide_index=True, use_container_width=True)
+
+                    if lead_id_col and lead_id_col in c_df.columns:
+                        dup_leads = int(lead_events[lead_id_col].duplicated().sum())
+                        dup_refs = int(ref_events[lead_id_col].duplicated().sum())
+                        if dup_leads or dup_refs:
+                            st.caption(f"Duplicate IDs detected — leads: {dup_leads}, referrals: {dup_refs}. Consider de-duplicating by LeadId.")
                 else:
                     st.caption("Lead → referral reconciliation requires LeadId and ParentLeadId/ReferrerLeadId columns.")
 
-                c_ts = (
-                    c_df.assign(period=c_df["event_date"].dt.to_period(trend_period).dt.start_time)
-                    .groupby("period", as_index=False)
-                    .agg(
-                        Spend=("_event_spend", "sum"),
-                        Leads=("is_referral_bool", lambda x: (~x).sum()),
-                        Referrals=("is_referral_bool", "sum"),
-                        Revenue=("_event_revenue", lambda s: s.sum(min_count=1))
+                tmp = c_df.assign(period=c_df["event_date"].dt.to_period(trend_period).dt.start_time)
+                if use_unique_ids and lead_id_col and lead_id_col in tmp.columns:
+                    c_ts = (
+                        tmp.groupby("period", as_index=False)
+                        .apply(lambda g: pd.Series({
+                            "Spend": g["_event_spend"].sum(),
+                            "Leads": g.loc[g["is_referral_bool"] == False, lead_id_col].nunique(),
+                            "Referrals": g.loc[g["is_referral_bool"] == True, lead_id_col].nunique(),
+                            "Revenue": g["_event_revenue"].sum(min_count=1)
+                        }))
                     )
-                )
+                else:
+                    c_ts = (
+                        tmp.groupby("period", as_index=False)
+                        .agg(
+                            Spend=("_event_spend", "sum"),
+                            Leads=("is_referral_bool", lambda x: (~x).sum()),
+                            Referrals=("is_referral_bool", "sum"),
+                            Revenue=("_event_revenue", lambda s: s.sum(min_count=1))
+                        )
+                    )
                 c_ts["CPR"] = np.where(
                     (c_ts["Leads"] + c_ts["Referrals"]) > 0,
                     c_ts["Spend"] / (c_ts["Leads"] + c_ts["Referrals"]),
