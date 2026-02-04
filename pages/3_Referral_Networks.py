@@ -20,7 +20,7 @@ if str(root) not in sys.path:
     sys.path.insert(0, str(root))
 
 from src.data_loader import load_events, load_origin_perf, load_media_raw, export_to_excel
-from src.normalization import normalize_events
+from src.normalization import normalize_events, normalize_media_raw
 from src.referral_clusters import run_referral_clustering
 from src.builder_pnl import build_builder_pnl
 from src.network_optimization import calculate_shortfalls, analyze_network_leverage, build_prescriptive_plan, compute_lag_metrics_simple
@@ -616,8 +616,23 @@ if 'load_critical_targets' not in st.session_state:
 def load_data(events_file):
     if events_file is None:
         return None
+    try:
+        events_file.seek(0)
+    except Exception:
+        pass
     events = load_events(events_file)
     return normalize_events(events) if events is not None else None
+
+@st.cache_data(show_spinner=False)
+def load_media_data(media_file):
+    if media_file is None:
+        return None
+    try:
+        media_file.seek(0)
+    except Exception:
+        pass
+    media_raw = load_media_raw(media_file)
+    return normalize_media_raw(media_raw) if media_raw is not None else None
 
 @st.cache_data(show_spinner=False)
 def process_network(_events, start_date, end_date, excluded_builders):
@@ -861,6 +876,8 @@ def build_budget_flow_dot(allocations, target_analyses, total_budget, unallocate
 def main():
     events_file = st.session_state.get("events_file")
     events = load_data(events_file)
+    media_file = st.session_state.get("media_file")
+    media_raw = load_media_data(media_file)
     
     if events is None:
         st.warning("⚠️ Please upload Events data on the Home page.")
@@ -877,41 +894,147 @@ def main():
         st.switch_page("pages/5_Referral_Optimization.py")
         return
     
+    events_filtered = events
     # Sidebar
     with st.sidebar:
         st.markdown("### Filters")
         dates = pd.to_datetime(events['lead_date'], errors='coerce').dropna()
         min_d, max_d = dates.min().date(), dates.max().date()
         date_range = st.date_input("Date Range", value=(min_d, max_d))
+
+        def _find_col(columns, candidates):
+            col_map = {c.strip().lower(): c for c in columns}
+            for cand in candidates:
+                if cand in columns:
+                    return cand
+                key = cand.strip().lower()
+                if key in col_map:
+                    return col_map[key]
+            return None
+
+        event_campaign_col = _find_col(
+            events.columns,
+            ["ad_key", "utm_key", "utm_campaign", "Campaign", "campaign"]
+        )
+        exclude_paused_campaigns = st.checkbox(
+            "Exclude PAUSED campaigns (media effective_status)",
+            key="exclude_paused_campaigns",
+            value=False,
+            help="Filters out campaigns with effective_status = PAUSED or CAMPAIGN_PAUSED from media_raw_base_phase0."
+        )
+        if exclude_paused_campaigns:
+            if media_raw is None or media_raw.empty:
+                st.warning("Paused-campaign filter enabled but no media file uploaded.")
+            else:
+                media_ad_col = _find_col(
+                    media_raw.columns,
+                    ["ad_key", "Ad: Ad name", "ad_name", "utm_key", "utm_campaign", "Campaign", "campaign", "campaign_name", "Campaign name"]
+                )
+                media_status_col = _find_col(
+                    media_raw.columns,
+                    ["effective_status", "Effective_Status", "status", "Status"]
+                )
+                if not media_ad_col or not media_status_col:
+                    st.warning("Paused-campaign filter enabled but media file missing effective_status or ad key.")
+                elif not event_campaign_col:
+                    st.warning("Paused-campaign filter enabled but events missing campaign key (ad_key/utm_key/utm_campaign).")
+                else:
+                    statuses = media_raw[media_status_col].fillna("").astype(str).str.strip().str.upper()
+                    paused_mask = statuses.isin({"PAUSED", "CAMPAIGN_PAUSED"})
+                    paused_campaigns = set(
+                        media_raw.loc[paused_mask, media_ad_col]
+                        .dropna()
+                        .astype(str)
+                        .str.strip()
+                        .tolist()
+                    )
+                    if paused_campaigns:
+                        before = len(events_filtered)
+                        events_filtered = events_filtered[
+                            ~events_filtered[event_campaign_col]
+                            .astype(str)
+                            .str.strip()
+                            .isin(paused_campaigns)
+                        ]
+                        st.caption(
+                            f"Excluded {before - len(events_filtered):,} events from {len(paused_campaigns):,} paused campaigns."
+                        )
+                    else:
+                        st.caption("No paused campaigns found in media file.")
         
         builder_options = sorted(set(
-            events["MediaPayer_BuilderRegionKey"].dropna().unique().tolist() +
-            events["Dest_BuilderRegionKey"].dropna().unique().tolist()
+            events_filtered["MediaPayer_BuilderRegionKey"].dropna().unique().tolist() +
+            events_filtered["Dest_BuilderRegionKey"].dropna().unique().tolist()
         ))
+
+        status_col = _find_col(events_filtered.columns, ["STATUS", "Status", "status"])
+        default_excluded = []
+        if status_col:
+            status_series = events_filtered[status_col].fillna("").astype(str).str.strip().str.lower()
+            status_mask = status_series.isin({"paused", "early exit"})
+            builder_cols = []
+            for c in [
+                "BuilderRegionKey",
+                "Dest_BuilderRegionKey",
+                "MediaPayer_BuilderRegionKey",
+                "Origin_BuilderRegionKey",
+            ]:
+                col = _find_col(events_filtered.columns, [c])
+                if col and col not in builder_cols:
+                    builder_cols.append(col)
+            if builder_cols:
+                values = []
+                for col in builder_cols:
+                    values.extend(
+                        events_filtered.loc[status_mask, col].dropna().astype(str).tolist()
+                    )
+                default_excluded = sorted(set(values))
+        if "excluded_builders_initialized" not in st.session_state:
+            st.session_state["excluded_builders"] = [b for b in default_excluded if b in builder_options]
+            st.session_state["excluded_builders_initialized"] = True
+        if "excluded_builders_autosync" not in st.session_state:
+            st.session_state["excluded_builders_autosync"] = True
+
+        def _clear_excluded():
+            st.session_state["excluded_builders"] = []
+            if st.session_state.targets:
+                st.session_state.targets = []
+            st.session_state.focus_builder = None
+            st.session_state.optimization_result = None
+
+        def _sync_excluded():
+            st.session_state["excluded_builders"] = [b for b in default_excluded if b in builder_options]
+            if st.session_state.targets:
+                st.session_state.targets = [t for t in st.session_state.targets if t not in st.session_state["excluded_builders"]]
+            if st.session_state.focus_builder in set(st.session_state["excluded_builders"]):
+                st.session_state.focus_builder = None
+            st.session_state.optimization_result = None
+
+        st.checkbox(
+            "Auto-sync exclusions from STATUS",
+            key="excluded_builders_autosync",
+            help="When enabled, exclusions always follow STATUS = Paused/Early Exit."
+        )
+        if st.session_state["excluded_builders_autosync"]:
+            _sync_excluded()
         excluded = st.multiselect(
             "Exclude builders from clustering",
             builder_options,
             default=st.session_state.excluded_builders,
+            key="excluded_builders",
             help="Removes selected builders from the network graph and clustering."
         )
+        if not st.session_state["excluded_builders_autosync"]:
+            st.button("Reset exclusions to STATUS defaults", on_click=_sync_excluded)
         if excluded:
             chips = "".join(f"<span class='chip'>{html.escape(b)}</span>" for b in excluded)
             st.markdown(f"<div class='chip-row'>{chips}</div>", unsafe_allow_html=True)
-            if st.button("Clear excluded"):
-                st.session_state.excluded_builders = []
-                if st.session_state.targets:
-                    st.session_state.targets = []
-                st.session_state.focus_builder = None
-                st.session_state.optimization_result = None
-                st.rerun()
-        if set(excluded) != set(st.session_state.excluded_builders):
-            st.session_state.excluded_builders = excluded
-            if st.session_state.targets:
-                st.session_state.targets = [t for t in st.session_state.targets if t not in excluded]
-            if st.session_state.focus_builder in set(excluded):
-                st.session_state.focus_builder = None
-            st.session_state.optimization_result = None
-            st.rerun()
+            st.button("Clear excluded", on_click=_clear_excluded)
+        if st.session_state.targets:
+            st.session_state.targets = [t for t in st.session_state.targets if t not in excluded]
+        if st.session_state.focus_builder in set(excluded):
+            st.session_state.focus_builder = None
+        st.session_state.optimization_result = None
         
         st.markdown("---")
         st.markdown("### Campaign Targets")
@@ -942,12 +1065,12 @@ def main():
     else:
         start_d, end_d = min_d, max_d
     with st.spinner("Analyzing..."):
-        data = process_network(events, start_d, end_d, tuple(st.session_state.excluded_builders))
+        data = process_network(events_filtered, start_d, end_d, tuple(st.session_state.excluded_builders))
     
     G = data['graph']
     bm = data['builder_master']
     sf = data['shortfalls']
-    lag_metrics = compute_lag_metrics_simple(events)
+    lag_metrics = compute_lag_metrics_simple(events_filtered)
 
     if st.session_state.load_critical_targets and not sf.empty:
         critical = sf[sf["Risk_Score"] > 50].copy()
