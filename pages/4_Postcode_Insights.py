@@ -2115,6 +2115,48 @@ def main():
                 })
                 st.dataframe(trace_df, hide_index=True, use_container_width=True)
 
+                # Reconcile leads to referrals via parent linkage (if available)
+                lead_id_col = _find_col(df.columns, ["LeadId", "lead_id", "LeadID"])
+                parent_id_col = _find_col(
+                    df.columns,
+                    ["ParentLeadId", "Parent_LeadId", "ParentLeadID", "ReferrerLeadId", "Referrer_LeadId",
+                     "RefLeadId", "ParentLead", "ReferrerLead"]
+                )
+                if lead_id_col and parent_id_col:
+                    parent_source = df[[lead_id_col, campaign_col, "is_referral_bool"]].dropna(subset=[lead_id_col])
+                    lead_parent_source = parent_source[parent_source["is_referral_bool"] == False]
+                    if lead_parent_source.empty:
+                        lead_parent_source = parent_source
+                    parent_campaign_map = (
+                        lead_parent_source.drop_duplicates(lead_id_col)
+                        .set_index(lead_id_col)[campaign_col]
+                    )
+                    referrals_all = df[df["is_referral_bool"] == True].copy()
+                    referrals_all["_parent_campaign"] = referrals_all[parent_id_col].map(parent_campaign_map)
+                    referrals_from_campaign = int((referrals_all["_parent_campaign"] == campaign_pick).sum())
+                    referrals_with_parent = int(referrals_all["_parent_campaign"].notna().sum())
+                    total_referrals_all = int(len(referrals_all))
+                    recon_df = pd.DataFrame({
+                        "Metric": [
+                            "Leads tagged with campaign",
+                            "Referrals tagged with campaign",
+                            "Referrals generated from campaign leads (parent link)",
+                            "Parent link coverage (all referrals)",
+                            "Lead → Referral conversion (parent-linked)"
+                        ],
+                        "Value": [
+                            camp_kpis["Leads"],
+                            camp_kpis["Referrals"],
+                            referrals_from_campaign,
+                            _fmt(_safe_div(referrals_with_parent, total_referrals_all), fmt="{:.0%}"),
+                            _fmt(_safe_div(referrals_from_campaign, camp_kpis["Leads"]), fmt="{:.0%}")
+                        ]
+                    })
+                    st.markdown("**Lead → referral reconciliation**")
+                    st.dataframe(recon_df, hide_index=True, use_container_width=True)
+                else:
+                    st.caption("Lead → referral reconciliation requires LeadId and ParentLeadId/ReferrerLeadId columns.")
+
                 c_ts = (
                     c_df.assign(period=c_df["event_date"].dt.to_period(trend_period).dt.start_time)
                     .groupby("period", as_index=False)
