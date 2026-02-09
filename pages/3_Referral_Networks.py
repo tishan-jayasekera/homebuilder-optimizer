@@ -9,6 +9,7 @@ import networkx as nx
 import plotly.graph_objects as go
 import plotly.express as px
 import html
+import json
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
 from io import BytesIO
@@ -25,6 +26,7 @@ from src.normalization import normalize_events
 from src.referral_clusters import run_referral_clustering
 from src.builder_pnl import build_builder_pnl
 from src.network_optimization import calculate_shortfalls, analyze_network_leverage, build_prescriptive_plan, compute_lag_metrics_simple
+from src.referral_logic import count_leads_refs, lead_ref_masks, prepare_referral_ids
 
 st.set_page_config(page_title="Referral Network Analysis", page_icon="🔗", layout="wide")
 
@@ -259,11 +261,10 @@ class NetworkOptimizer:
                 )
         
         if direct_cost > 0 and direct_refs_in > 0:
-            # Direct CPR = cost / refs received (simplified model)
+            # Direct CPR = cost / refs received (aligned to campaign CPR)
             target_roas = self.roas.get(target, 1.0)
             direct_cpr = direct_cost / direct_refs_in
-            # Effective CPR adjusts for ROAS quality
-            eff_cpr = direct_cpr / max(target_roas, 0.1)
+            eff_cpr = direct_cpr
             
             paths.append(MediaPath(
                 target=target,
@@ -301,8 +302,6 @@ class NetworkOptimizer:
                     base_cpr = source_cost / source_total
                     # Effective CPR = base CPR / transfer_rate (cost to get 1 ref to target)
                     eff_cpr = base_cpr / max(transfer_rate, 0.01)
-                    # Adjust for source quality
-                    eff_cpr = eff_cpr / max(source_roas, 0.1)
                     
                     paths.append(MediaPath(
                         target=target,
@@ -353,7 +352,6 @@ class NetworkOptimizer:
                             if combined_rate > 0.001:  # Minimum viability threshold
                                 base_cpr = source_cost / source_total
                                 eff_cpr = base_cpr / combined_rate
-                                eff_cpr = eff_cpr / max(source_roas, 0.1)
                                 
                                 paths.append(MediaPath(
                                     target=target,
@@ -599,6 +597,36 @@ class NetworkOptimizer:
 # ============================================================================
 # SESSION STATE
 # ============================================================================
+STATE_PATH = root / ".streamlit" / "excluded_builders_state.json"
+
+def _load_exclusion_state():
+    try:
+        if STATE_PATH.exists():
+            with STATE_PATH.open("r") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+    return {}
+
+def _save_exclusion_state(state):
+    try:
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with STATE_PATH.open("w") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+
+def _events_key(events_file):
+    if events_file is None:
+        return "no-events"
+    try:
+        name = getattr(events_file, "name", "events")
+        size = getattr(events_file, "size", "")
+        return f"{name}:{size}"
+    except Exception:
+        return "events"
+
 if 'targets' not in st.session_state:
     st.session_state.targets = []
 if 'focus_builder' not in st.session_state:
@@ -706,7 +734,7 @@ def render_network_graph(G, builder_master, focus=None, targets=None, color_mode
         if color_mode == "Network Leverage":
             rm_val = rm_map.get(node, 1.0)
             rm_norm = min(max((rm_val - 1.0) / 1.0, 0.0), 1.0)
-            scale = px.colors.sequential.RdYlGn
+            scale = getattr(px.colors.sequential, "RdYlGn", None) or getattr(px.colors.diverging, "RdYlGn", px.colors.sequential.Viridis)
             color = scale[int(rm_norm * (len(scale) - 1))]
             hover = f"<b>{node}</b><br>RM: {rm_val:.2f}x"
         else:
@@ -870,6 +898,7 @@ def main():
         st.warning("⚠️ Please upload Events data on the Home page.")
         st.page_link("app.py", label="← Go to Home", icon="🏠")
         return
+    events, _, _, _ = prepare_referral_ids(events, inplace=False)
 
     view = st.radio(
         "View",
@@ -928,29 +957,63 @@ def main():
             events_filtered["Dest_BuilderRegionKey"].dropna().unique().tolist()
         ))
 
-        if "excluded_builders_initialized" not in st.session_state:
-            st.session_state["excluded_builders"] = [
-                b for b in sorted(set(default_excluded)) if b in builder_options
-            ]
-            st.session_state["excluded_builders_initialized"] = True
+        dataset_key = _events_key(st.session_state.get("events_file"))
+        if "excluded_builders_by_dataset" not in st.session_state:
+            st.session_state["excluded_builders_by_dataset"] = _load_exclusion_state()
+        else:
+            persisted = _load_exclusion_state()
+            for k, v in persisted.items():
+                if k not in st.session_state["excluded_builders_by_dataset"]:
+                    st.session_state["excluded_builders_by_dataset"][k] = v
+
+        if dataset_key not in st.session_state["excluded_builders_by_dataset"]:
+            st.session_state["excluded_builders_by_dataset"][dataset_key] = sorted(set(default_excluded))
+
+        if st.session_state.get("excluded_builders_dataset_key") != dataset_key:
+            st.session_state["excluded_builders"] = list(st.session_state["excluded_builders_by_dataset"][dataset_key])
+            st.session_state["excluded_builders_dataset_key"] = dataset_key
+            _save_exclusion_state(st.session_state["excluded_builders_by_dataset"])
+
+        if st.session_state.excluded_builders:
+            builder_options = sorted(set(builder_options) | set(st.session_state.excluded_builders))
+
+        def _persist_exclusions():
+            st.session_state["excluded_builders_by_dataset"][dataset_key] = list(st.session_state.get("excluded_builders", []))
+            _save_exclusion_state(st.session_state["excluded_builders_by_dataset"])
+
+        def _apply_default_exclusions():
+            st.session_state["excluded_builders"] = list(sorted(set(default_excluded)))
+            _persist_exclusions()
+            if st.session_state.targets:
+                st.session_state.targets = [t for t in st.session_state.targets if t not in st.session_state["excluded_builders"]]
+            if st.session_state.focus_builder in set(st.session_state["excluded_builders"]):
+                st.session_state.focus_builder = None
+            st.session_state.optimization_result = None
 
         def _clear_excluded():
             st.session_state["excluded_builders"] = []
+            _persist_exclusions()
             if st.session_state.targets:
                 st.session_state.targets = []
             st.session_state.focus_builder = None
             st.session_state.optimization_result = None
+
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            st.button("Load default exclusions", on_click=_apply_default_exclusions)
+        with c2:
+            st.button("Clear excluded", on_click=_clear_excluded)
         excluded = st.multiselect(
             "Exclude builders from clustering",
             builder_options,
             default=st.session_state.excluded_builders,
             key="excluded_builders",
-            help="Removes selected builders from the network graph and clustering."
+            help="Removes selected builders from the network graph and clustering.",
+            on_change=_persist_exclusions
         )
         if excluded:
             chips = "".join(f"<span class='chip'>{html.escape(b)}</span>" for b in excluded)
             st.markdown(f"<div class='chip-row'>{chips}</div>", unsafe_allow_html=True)
-            st.button("Clear excluded", on_click=_clear_excluded)
         if st.session_state.targets:
             st.session_state.targets = [t for t in st.session_state.targets if t not in excluded]
         if st.session_state.focus_builder in set(excluded):
@@ -1064,12 +1127,16 @@ def main():
         rm_map = {}
         events_df = data["events"]
         if "MediaPayer_BuilderRegionKey" in events_df.columns:
-            total = events_df.groupby("MediaPayer_BuilderRegionKey").size()
-            if "is_origin" in events_df.columns:
-                direct = events_df[events_df["is_origin"] == True].groupby("MediaPayer_BuilderRegionKey").size()
-            else:
-                direct = pd.Series(dtype=float)
-            rm_map = (total / direct.replace(0, np.nan)).fillna(1.0).to_dict()
+            def _rm_counts(g):
+                leads, _, events, _ = count_leads_refs(g)
+                return pd.Series({"Events": events, "Leads": leads})
+            rm_counts = (
+                events_df.groupby("MediaPayer_BuilderRegionKey", dropna=False)
+                .apply(_rm_counts)
+                .reset_index()
+            )
+            rm_counts["RM"] = (rm_counts["Events"] / rm_counts["Leads"].replace(0, np.nan)).fillna(1.0)
+            rm_map = rm_counts.set_index("MediaPayer_BuilderRegionKey")["RM"].to_dict()
 
         fig = render_network_graph(G, bm, st.session_state.focus_builder, st.session_state.targets, color_mode=color_mode, rm_map=rm_map)
         st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
@@ -1084,26 +1151,19 @@ def main():
             pct_target = actual_refs / lead_target if lead_target > 0 else 0
 
             events_df = data["events"]
-            mask_referral = events_df["is_referral"].fillna(False).astype(bool)
-            mask_cross_payer = (
-                events_df["MediaPayer_BuilderRegionKey"].notna() &
-                events_df["Dest_BuilderRegionKey"].notna() &
-                (events_df["MediaPayer_BuilderRegionKey"] != events_df["Dest_BuilderRegionKey"])
-            )
-            inbound = events_df[
-                (mask_referral | mask_cross_payer) &
-                (events_df["Dest_BuilderRegionKey"] == focus)
-            ].copy()
-            inbound["lead_date"] = pd.to_datetime(inbound["lead_date"], errors="coerce")
-            inbound = inbound.dropna(subset=["lead_date"])
-            max_date = inbound["lead_date"].max() if not inbound.empty else None
+            inbound = events_df[events_df["Dest_BuilderRegionKey"] == focus].copy()
+            ref_date_col = "RefDate" if "RefDate" in inbound.columns else "lead_date"
+            inbound[ref_date_col] = pd.to_datetime(inbound[ref_date_col], errors="coerce")
+            inbound = inbound.dropna(subset=[ref_date_col])
+            max_date = inbound[ref_date_col].max() if not inbound.empty else None
 
             def avg_refs(days):
                 if max_date is None:
                     return 0.0
                 start = max_date - pd.Timedelta(days=days)
-                count = inbound[inbound["lead_date"] >= start]["LeadId"].nunique()
-                return count / days if days > 0 else 0.0
+                subset = inbound[inbound[ref_date_col] >= start]
+                _, refs, _, _ = count_leads_refs(subset)
+                return refs / days if days > 0 else 0.0
 
             avg_2 = avg_refs(2)
             avg_7 = avg_refs(7)
@@ -1250,19 +1310,15 @@ def main():
     if st.session_state.focus_builder:
         focus = st.session_state.focus_builder
         events_df = data["events"]
-        mask_referral = events_df["is_referral"].fillna(False).astype(bool)
-        mask_cross_payer = (
-            events_df["MediaPayer_BuilderRegionKey"].notna() &
-            events_df["Dest_BuilderRegionKey"].notna() &
-            (events_df["MediaPayer_BuilderRegionKey"] != events_df["Dest_BuilderRegionKey"])
-        )
-        inbound = events_df[
-            (mask_referral | mask_cross_payer) &
-            (events_df["Dest_BuilderRegionKey"] == focus)
-        ].copy()
+        inbound = events_df[events_df["Dest_BuilderRegionKey"] == focus].copy()
         if inbound.empty:
             st.caption("No inbound referrals in the filtered time window.")
         else:
+            _, inbound_refs, _, _ = count_leads_refs(inbound)
+            if inbound_refs == 0:
+                st.caption("No inbound referrals in the filtered time window.")
+                inbound = pd.DataFrame()
+        if not inbound.empty:
             campaign_col = next(
                 (c for c in ["utm_campaign", "utm_key", "ad_key"] if c in inbound.columns),
                 None
@@ -1270,12 +1326,15 @@ def main():
             if campaign_col:
                 inbound["Campaign"] = inbound[campaign_col].fillna("Unknown")
                 inbound["MediaCost_referral_event"] = inbound.get("MediaCost_referral_event", 0).fillna(0)
+                def _campaign_summary(g):
+                    _, refs, _, orig_set = count_leads_refs(g)
+                    _, ref_mask = lead_ref_masks(g, orig_set)
+                    spend = float(g.loc[ref_mask, "MediaCost_referral_event"].sum())
+                    return pd.Series({"Referrals": refs, "Ad_Spend": spend})
                 leaderboard = (
-                    inbound.groupby("Campaign", as_index=False)
-                    .agg(
-                        Referrals=("LeadId", "nunique"),
-                        Ad_Spend=("MediaCost_referral_event", "sum")
-                    )
+                    inbound.groupby("Campaign", dropna=False)
+                    .apply(_campaign_summary)
+                    .reset_index()
                 )
                 leaderboard["CPR"] = np.where(
                     leaderboard["Referrals"] > 0,
@@ -1309,18 +1368,19 @@ def main():
                 label_visibility="collapsed",
                 key="inbound_grain"
             )
-            inbound["lead_date"] = pd.to_datetime(inbound["lead_date"], errors="coerce")
-            inbound = inbound.dropna(subset=["lead_date"])
+            ref_date_col = "RefDate" if "RefDate" in inbound.columns else "lead_date"
+            inbound[ref_date_col] = pd.to_datetime(inbound[ref_date_col], errors="coerce")
+            inbound = inbound.dropna(subset=[ref_date_col])
             period_freq = "W" if grain == "Weekly" else "M"
-            inbound["period"] = inbound["lead_date"].dt.to_period(period_freq).dt.start_time
+            inbound["period"] = inbound[ref_date_col].dt.to_period(period_freq).dt.start_time
             if stack_by == "Campaign":
                 if not campaign_col:
                     st.caption("No campaign fields found (utm_campaign, utm_key, ad_key).")
                 else:
                     ts = (
-                        inbound.groupby(["period", "Campaign"], as_index=False)["LeadId"]
-                        .nunique()
-                        .rename(columns={"LeadId": "Inbound Referrals"})
+                        inbound.groupby(["period", "Campaign"], dropna=False)
+                        .apply(lambda g: count_leads_refs(g)[1])
+                        .reset_index(name="Inbound Referrals")
                     )
                     campaign_filter = st.selectbox(
                         "Filter campaign",
@@ -1356,12 +1416,10 @@ def main():
                     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
             else:
                 ts = (
-                    inbound.groupby(["period", "MediaPayer_BuilderRegionKey"], as_index=False)["LeadId"]
-                    .nunique()
-                    .rename(columns={
-                        "LeadId": "Inbound Referrals",
-                        "MediaPayer_BuilderRegionKey": "Source Builder"
-                    })
+                    inbound.groupby(["period", "MediaPayer_BuilderRegionKey"], dropna=False)
+                    .apply(lambda g: count_leads_refs(g)[1])
+                    .reset_index(name="Inbound Referrals")
+                    .rename(columns={"MediaPayer_BuilderRegionKey": "Source Builder"})
                 )
                 source_filter = st.selectbox(
                     "Filter source",
@@ -1403,19 +1461,15 @@ def main():
     if st.session_state.focus_builder:
         focus = st.session_state.focus_builder
         events_df = data["events"]
-        mask_referral = events_df["is_referral"].fillna(False).astype(bool)
-        mask_cross_payer = (
-            events_df["MediaPayer_BuilderRegionKey"].notna() &
-            events_df["Dest_BuilderRegionKey"].notna() &
-            (events_df["MediaPayer_BuilderRegionKey"] != events_df["Dest_BuilderRegionKey"])
-        )
-        outbound = events_df[
-            (mask_referral | mask_cross_payer) &
-            (events_df["MediaPayer_BuilderRegionKey"] == focus)
-        ].copy()
+        outbound = events_df[events_df["MediaPayer_BuilderRegionKey"] == focus].copy()
         if outbound.empty:
             st.caption("No outbound referrals in the filtered time window.")
         else:
+            _, outbound_refs, _, _ = count_leads_refs(outbound)
+            if outbound_refs == 0:
+                st.caption("No outbound referrals in the filtered time window.")
+                outbound = pd.DataFrame()
+        if not outbound.empty:
             grain_out = st.radio(
                 "Time grain",
                 ["Weekly", "Monthly"],
@@ -1423,13 +1477,15 @@ def main():
                 label_visibility="collapsed",
                 key="outbound_grain"
             )
-            outbound["lead_date"] = pd.to_datetime(outbound["lead_date"], errors="coerce")
-            outbound = outbound.dropna(subset=["lead_date"])
+            ref_date_col = "RefDate" if "RefDate" in outbound.columns else "lead_date"
+            outbound[ref_date_col] = pd.to_datetime(outbound[ref_date_col], errors="coerce")
+            outbound = outbound.dropna(subset=[ref_date_col])
             period_freq = "W" if grain_out == "Weekly" else "M"
-            outbound["period"] = outbound["lead_date"].dt.to_period(period_freq).dt.start_time
+            outbound["period"] = outbound[ref_date_col].dt.to_period(period_freq).dt.start_time
             leaderboard = (
-                outbound.groupby("Dest_BuilderRegionKey", as_index=False)
-                .agg(Referrals=("LeadId", "nunique"))
+                outbound.groupby("Dest_BuilderRegionKey", dropna=False)
+                .apply(lambda g: count_leads_refs(g)[1])
+                .reset_index(name="Referrals")
                 .rename(columns={"Dest_BuilderRegionKey": "Destination Builder"})
                 .sort_values("Referrals", ascending=False)
                 .head(15)
@@ -1438,12 +1494,10 @@ def main():
             st.dataframe(leaderboard, hide_index=True, use_container_width=True)
 
             ts = (
-                outbound.groupby(["period", "Dest_BuilderRegionKey"], as_index=False)["LeadId"]
-                .nunique()
-                .rename(columns={
-                    "LeadId": "Outbound Referrals",
-                    "Dest_BuilderRegionKey": "Destination Builder"
-                })
+                outbound.groupby(["period", "Dest_BuilderRegionKey"], dropna=False)
+                .apply(lambda g: count_leads_refs(g)[1])
+                .reset_index(name="Outbound Referrals")
+                .rename(columns={"Dest_BuilderRegionKey": "Destination Builder"})
             )
             dest_filter = st.selectbox(
                 "Filter destination",
@@ -1690,27 +1744,23 @@ def main():
                     return ""
                 if "Dest_BuilderRegionKey" not in df.columns or "MediaPayer_BuilderRegionKey" not in df.columns:
                     return ""
-                mask_referral = df["is_referral"].fillna(False).astype(bool) if "is_referral" in df.columns else pd.Series(False, index=df.index)
-                mask_cross_payer = (
-                    df["MediaPayer_BuilderRegionKey"].notna() &
-                    df["Dest_BuilderRegionKey"].notna() &
-                    (df["MediaPayer_BuilderRegionKey"] != df["Dest_BuilderRegionKey"])
-                )
-                inbound = df[
-                    (mask_referral | mask_cross_payer) &
-                    (df["Dest_BuilderRegionKey"] == target)
-                ].copy()
+                inbound = df[df["Dest_BuilderRegionKey"] == target].copy()
                 if inbound.empty:
                     return ""
                 inbound["Campaign"] = inbound[campaign_col].fillna("Unknown")
-                ref_col = "LeadId" if "LeadId" in inbound.columns else None
-                if ref_col:
-                    grouped = inbound.groupby("Campaign", as_index=False).agg(Referrals=(ref_col, "nunique"))
-                else:
-                    grouped = inbound.groupby("Campaign", as_index=False).size().rename(columns={"size": "Referrals"})
+                def _campaign_summary(g):
+                    _, refs, _, orig_set = count_leads_refs(g)
+                    _, ref_mask = lead_ref_masks(g, orig_set)
+                    spend = float(g.loc[ref_mask, "MediaCost_referral_event"].sum()) if "MediaCost_referral_event" in g.columns else 0.0
+                    return pd.Series({"Referrals": refs, "Ad_Spend": spend})
+                grouped = (
+                    inbound.groupby("Campaign", dropna=False)
+                    .apply(_campaign_summary)
+                    .reset_index()
+                )
+                if grouped["Referrals"].sum() <= 0:
+                    return ""
                 if "MediaCost_referral_event" in inbound.columns:
-                    spend = inbound.groupby("Campaign", as_index=False)["MediaCost_referral_event"].sum()
-                    grouped = grouped.merge(spend, on="Campaign", how="left").rename(columns={"MediaCost_referral_event": "Ad_Spend"})
                     grouped["CPR"] = np.where(
                         grouped["Referrals"] > 0,
                         grouped["Ad_Spend"] / grouped["Referrals"],

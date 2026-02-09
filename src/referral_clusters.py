@@ -6,6 +6,8 @@ import numpy as np
 import networkx as nx
 from collections import defaultdict
 
+from .referral_logic import count_leads_refs, lead_ref_masks, prepare_referral_ids
+
 try:
     from community import community_louvain
     HAS_LOUVAIN = True
@@ -98,45 +100,49 @@ def run_referral_clustering(
     """
     df = events.copy()
     
-    required = ["LeadId", "Dest_BuilderRegionKey", "MediaPayer_BuilderRegionKey", "is_referral"]
+    required = ["Dest_BuilderRegionKey", "MediaPayer_BuilderRegionKey"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise KeyError(f"Missing required columns: {missing}")
+
+    df, use_ids, _, _ = prepare_referral_ids(df, inplace=True)
+    if not use_ids and "LeadId" not in df.columns:
+        raise KeyError("Missing LeadId or deal ID columns for referral counts.")
     
-    # Referral definition
-    mask_referral = df["is_referral"].fillna(False).astype(bool)
-    mask_cross_payer = (
+    df_ref = df[
         df["MediaPayer_BuilderRegionKey"].notna() &
-        df["Dest_BuilderRegionKey"].notna() &
-        (df["MediaPayer_BuilderRegionKey"] != df["Dest_BuilderRegionKey"])
-    )
-    
-    df_ref = df.loc[mask_referral | mask_cross_payer].copy()
-    
+        df["Dest_BuilderRegionKey"].notna()
+    ].copy()
     if df_ref.empty:
         return {"edges_raw": pd.DataFrame(), "edges_clean": pd.DataFrame(),
                 "builder_master": pd.DataFrame(), "cluster_summary": pd.DataFrame(), "graph": nx.Graph()}
-    
-    # Build edges
-    df_ref = df_ref[
-        df_ref["MediaPayer_BuilderRegionKey"].notna() &
-        df_ref["Dest_BuilderRegionKey"].notna()
-    ]
+
     df_ref["Origin_builder"] = df_ref["MediaPayer_BuilderRegionKey"]
     df_ref["Dest_builder"] = df_ref["Dest_BuilderRegionKey"]
-    
-    # Remove self-loops
-    df_ref = df_ref[df_ref["Origin_builder"] != df_ref["Dest_builder"]]
-    
-    if df_ref.empty:
-        return {"edges_raw": pd.DataFrame(), "edges_clean": pd.DataFrame(),
-                "builder_master": pd.DataFrame(), "cluster_summary": pd.DataFrame(), "graph": nx.Graph()}
-    
-    edges_raw = (
-        df_ref.groupby(["Origin_builder", "Dest_builder"], as_index=False)["LeadId"]
-        .nunique()
-        .rename(columns={"LeadId": "Referrals"})
-    )
+
+    if use_ids:
+        edges_raw = (
+            df_ref.groupby(["Origin_builder", "Dest_builder"], dropna=False)
+            .apply(lambda g: pd.Series({"Referrals": count_leads_refs(g)[1]}))
+            .reset_index()
+        )
+    else:
+        _, ref_mask = lead_ref_masks(df_ref, None)
+        df_ref = df_ref.loc[ref_mask].copy()
+        if "LeadId" in df_ref.columns:
+            edges_raw = (
+                df_ref.groupby(["Origin_builder", "Dest_builder"], as_index=False)["LeadId"]
+                .nunique()
+                .rename(columns={"LeadId": "Referrals"})
+            )
+        else:
+            edges_raw = (
+                df_ref.groupby(["Origin_builder", "Dest_builder"], as_index=False)
+                .size()
+                .rename(columns={"size": "Referrals"})
+            )
+
+    edges_raw = edges_raw[edges_raw["Origin_builder"] != edges_raw["Dest_builder"]]
     
     # Prune edges
     edges_clean = edges_raw[edges_raw["Referrals"] >= min_edge_weight].copy()

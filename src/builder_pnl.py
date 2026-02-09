@@ -4,6 +4,7 @@ Builder P&L calculation module for IBN HS Analytics
 import pandas as pd
 import numpy as np
 from .normalization import clean_builder_keys
+from .referral_logic import count_leads_refs, prepare_referral_ids
 
 
 def add_period_cols(events_df: pd.DataFrame, date_basis: str = "lead_date", freq: str = "M") -> pd.DataFrame:
@@ -21,6 +22,7 @@ def add_period_cols(events_df: pd.DataFrame, date_basis: str = "lead_date", freq
     DataFrame with event_date_basis and period_start columns
     """
     df = events_df.copy()
+    df, use_ids, _, _ = prepare_referral_ids(df, inplace=True)
     
     if date_basis not in ["lead_date", "RefDate"]:
         raise ValueError("date_basis must be 'lead_date' or 'RefDate'.")
@@ -130,22 +132,44 @@ def build_builder_pnl(
     group_cols = ["BuilderRegionKey"]
     if freq in ("M", "W"):
         group_cols.append("period_start")
-    
-    # Events count
-    n_events_col = "LeadId" if "LeadId" in df.columns else "Revenue_val"
-    n_events_agg = ("nunique" if "LeadId" in df.columns else "size")
-    
+
     agg = (
         df.groupby(group_cols, dropna=False)
         .agg(
             Revenue=("Revenue_val", "sum"),
             MediaCost=("MediaCost_val", "sum"),
-            N_events=(n_events_col, n_events_agg),
-            N_origin=("is_origin_bool", "sum"),
-            N_referrals=("is_referral_bool", "sum"),
         )
         .reset_index()
     )
+
+    if use_ids:
+        def _counts(g):
+            leads, refs, events, _ = count_leads_refs(g)
+            return pd.Series({
+                "N_events": events,
+                "N_origin": leads,
+                "N_referrals": refs,
+            })
+        counts = (
+            df.groupby(group_cols, dropna=False)
+            .apply(_counts)
+            .reset_index()
+        )
+        agg = agg.merge(counts, on=group_cols, how="left")
+    else:
+        # Events count
+        n_events_col = "LeadId" if "LeadId" in df.columns else "Revenue_val"
+        n_events_agg = ("nunique" if "LeadId" in df.columns else "size")
+        counts = (
+            df.groupby(group_cols, dropna=False)
+            .agg(
+                N_events=(n_events_col, n_events_agg),
+                N_origin=("is_origin_bool", "sum"),
+                N_referrals=("is_referral_bool", "sum"),
+            )
+            .reset_index()
+        )
+        agg = agg.merge(counts, on=group_cols, how="left")
     
     # Derived KPIs
     agg["Profit"] = agg["Revenue"] - agg["MediaCost"]

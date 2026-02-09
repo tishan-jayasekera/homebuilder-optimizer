@@ -6,6 +6,8 @@ import pandas as pd
 import numpy as np
 from typing import List, Dict, Optional, Tuple
 
+from .referral_logic import count_leads_refs, lead_ref_masks, prepare_referral_ids
+
 def _find_col(columns, candidates):
     col_map = {c.lower(): c for c in columns}
     for cand in candidates:
@@ -133,9 +135,22 @@ def build_prescriptive_plan(
     if attrib_col is None:
         return pd.DataFrame(), pd.DataFrame()
 
+    events_df, use_ids, _, _ = prepare_referral_ids(events_df, inplace=False)
     payer_spend = events_df.groupby(attrib_col)[cost_col].sum() if cost_col else pd.Series()
-    total_leads = events_df.groupby(attrib_col).size()
-    direct = events_df[_normalize_bool(events_df[is_origin_col]) == True].groupby(attrib_col).size() if is_origin_col else pd.Series()
+    if use_ids:
+        def _payer_counts(g):
+            leads, _, events, _ = count_leads_refs(g)
+            return pd.Series({"Total_Events": events, "Direct_Leads": leads})
+        payer_counts = (
+            events_df.groupby(attrib_col, dropna=False)
+            .apply(_payer_counts)
+            .reset_index()
+        )
+        total_leads = payer_counts.set_index(attrib_col)["Total_Events"]
+        direct = payer_counts.set_index(attrib_col)["Direct_Leads"]
+    else:
+        total_leads = events_df.groupby(attrib_col).size()
+        direct = events_df[_normalize_bool(events_df[is_origin_col]) == True].groupby(attrib_col).size() if is_origin_col else pd.Series()
     rm = (total_leads / direct.replace(0, np.nan)).fillna(1.0)
     payer_cpl_net = (payer_spend / total_leads.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
 
@@ -245,20 +260,28 @@ def calculate_shortfalls(
 
     lead_date_col = 'lead_date' if 'lead_date' in events_df.columns else None
     ref_date_col = 'RefDate' if 'RefDate' in events_df.columns else None
+    events_df, _, _, _ = prepare_referral_ids(events_df, inplace=False)
 
     # Prefer qualified lead velocity when available
-    if ref_date_col and 'Dest_BuilderRegionKey' in events_df.columns:
-        period_actuals = events_df[events_df[ref_date_col].notna()].groupby('Dest_BuilderRegionKey').size().reset_index(name='Period_Referrals')
-    elif 'is_referral' in events_df.columns and 'Dest_BuilderRegionKey' in events_df.columns:
-        period_actuals = events_df[events_df['is_referral'] == True].groupby('Dest_BuilderRegionKey').size().reset_index(name='Period_Referrals')
+    if 'Dest_BuilderRegionKey' in events_df.columns:
+        period_source = events_df[events_df[ref_date_col].notna()] if ref_date_col else events_df
+        period_actuals = (
+            period_source.groupby('Dest_BuilderRegionKey', dropna=False)
+            .apply(lambda g: count_leads_refs(g)[1])
+            .reset_index(name='Period_Referrals')
+        )
     else:
         period_actuals = pd.DataFrame(columns=['Dest_BuilderRegionKey', 'Period_Referrals'])
     
     if total_events_df is not None:
-        if ref_date_col and 'Dest_BuilderRegionKey' in total_events_df.columns:
-            cum_actuals = total_events_df[total_events_df[ref_date_col].notna()].groupby('Dest_BuilderRegionKey').size().reset_index(name='Actual_Referrals')
-        elif 'is_referral' in total_events_df.columns and 'Dest_BuilderRegionKey' in total_events_df.columns:
-            cum_actuals = total_events_df[total_events_df['is_referral'] == True].groupby('Dest_BuilderRegionKey').size().reset_index(name='Actual_Referrals')
+        total_events_df, _, _, _ = prepare_referral_ids(total_events_df, inplace=False)
+        if 'Dest_BuilderRegionKey' in total_events_df.columns:
+            cum_source = total_events_df[total_events_df[ref_date_col].notna()] if ref_date_col else total_events_df
+            cum_actuals = (
+                cum_source.groupby('Dest_BuilderRegionKey', dropna=False)
+                .apply(lambda g: count_leads_refs(g)[1])
+                .reset_index(name='Actual_Referrals')
+            )
         else:
             cum_actuals = pd.DataFrame(columns=['Dest_BuilderRegionKey', 'Actual_Referrals'])
         target_source_df = total_events_df 
@@ -354,60 +377,61 @@ def calculate_shortfalls(
 
 def analyze_network_leverage(events_df: pd.DataFrame) -> pd.DataFrame:
     """Analyze Supply Sources - Transfer Rate, CPR, eCPR."""
-    if 'is_referral' not in events_df.columns:
-        return pd.DataFrame()
-        
-    refs = events_df[events_df['is_referral'] == True].copy()
-    if refs.empty:
-        return pd.DataFrame()
+    events_df, use_ids, _, _ = prepare_referral_ids(events_df, inplace=False)
 
     payer_col = 'MediaPayer_BuilderRegionKey' if 'MediaPayer_BuilderRegionKey' in events_df.columns else None
-    lead_id_col = 'LeadId' if 'LeadId' in events_df.columns else None
+    dest_col = 'Dest_BuilderRegionKey' if 'Dest_BuilderRegionKey' in events_df.columns else None
     cost_col = 'MediaCost_referral_event' if 'MediaCost_referral_event' in events_df.columns else None
+    if payer_col is None or dest_col is None:
+        return pd.DataFrame()
 
-    source_stats = refs.groupby(payer_col).agg(
-        Total_Referrals_Sent=(lead_id_col, 'count') if lead_id_col else ('is_referral', 'size'),
-        Total_Media_Spend=(cost_col, 'sum') if cost_col else ('is_referral', 'size')
-    ).reset_index().rename(columns={payer_col: 'MediaPayer_BuilderRegionKey'})
-    
-    source_stats['CPR_base'] = np.where(
-        source_stats['Total_Referrals_Sent'] > 0,
-        source_stats['Total_Media_Spend'] / source_stats['Total_Referrals_Sent'],
+    def _source_stats(g):
+        leads, refs, events, orig_set = count_leads_refs(g)
+        lead_mask, ref_mask = lead_ref_masks(g, orig_set)
+        spend = pd.to_numeric(g.loc[ref_mask, cost_col], errors="coerce").sum() if cost_col else np.nan
+        return pd.Series({
+            "Total_Referrals_Sent": refs,
+            "Total_Media_Spend": spend,
+            "Total_Leads_Generated": events,
+            "Direct_Leads": leads,
+        })
+
+    source_stats = (
+        events_df.groupby(payer_col, dropna=False)
+        .apply(_source_stats)
+        .reset_index()
+        .rename(columns={payer_col: 'MediaPayer_BuilderRegionKey'})
+    )
+    source_stats["CPR_base"] = np.where(
+        source_stats["Total_Referrals_Sent"] > 0,
+        source_stats["Total_Media_Spend"] / source_stats["Total_Referrals_Sent"],
+        np.nan
+    )
+    source_stats["Referral_Multiplier"] = np.where(
+        source_stats["Direct_Leads"] > 0,
+        source_stats["Total_Leads_Generated"] / source_stats["Direct_Leads"],
+        1.0
+    )
+    source_stats["CPL_net"] = np.where(
+        source_stats["Total_Leads_Generated"] > 0,
+        source_stats["Total_Media_Spend"] / source_stats["Total_Leads_Generated"],
         np.nan
     )
 
-    # Network-adjusted CPL (CPL_net) using attributed payer if available
-    if '_attributed_payer' in events_df.columns:
-        attrib_col = '_attributed_payer'
-    else:
-        attrib_col = payer_col
+    def _flow_refs(g):
+        return count_leads_refs(g)[1]
 
-    if attrib_col:
-        total_leads = events_df.groupby(attrib_col).size().reset_index(name='Total_Leads_Generated')
-        if 'is_origin' in events_df.columns:
-            direct_leads = events_df[events_df['is_origin'] == True].groupby(attrib_col).size().reset_index(name='Direct_Leads')
-        else:
-            direct_leads = pd.DataFrame(columns=[attrib_col, 'Direct_Leads'])
-        network_stats = total_leads.merge(direct_leads, on=attrib_col, how='left').fillna(0)
-        network_stats['Referral_Multiplier'] = np.where(
-            network_stats['Direct_Leads'] > 0,
-            network_stats['Total_Leads_Generated'] / network_stats['Direct_Leads'],
-            1.0
-        )
-        network_stats = network_stats.rename(columns={attrib_col: 'MediaPayer_BuilderRegionKey'})
-        source_stats = source_stats.merge(network_stats, on='MediaPayer_BuilderRegionKey', how='left')
-        source_stats['CPL_net'] = np.where(
-            source_stats['Total_Leads_Generated'] > 0,
-            source_stats['Total_Media_Spend'] / source_stats['Total_Leads_Generated'],
-            np.nan
-        )
-    
-    flows = refs.groupby(['MediaPayer_BuilderRegionKey', 'Dest_BuilderRegionKey']).size().reset_index(name='Referrals_to_Target')
-    
+    flows = (
+        events_df.groupby([payer_col, dest_col], dropna=False)
+        .apply(_flow_refs)
+        .reset_index(name='Referrals_to_Target')
+    )
+    flows = flows[flows["Referrals_to_Target"] > 0]
+
     leverage = flows.merge(source_stats, on='MediaPayer_BuilderRegionKey', how='left')
-    leverage['Transfer_Rate'] = leverage['Referrals_to_Target'] / leverage['Total_Referrals_Sent']
+    leverage['Transfer_Rate'] = leverage['Referrals_to_Target'] / leverage['Total_Referrals_Sent'].replace(0, np.nan)
     leverage['eCPR'] = np.where(leverage['Transfer_Rate'] > 0, leverage['CPR_base'] / leverage['Transfer_Rate'], np.inf)
-    
+
     return leverage
 
 
