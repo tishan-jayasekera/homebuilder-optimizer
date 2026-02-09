@@ -337,6 +337,11 @@ def main():
         ts_campaign["Revenue"] / ts_campaign["Events"],
         np.nan
     )
+    ts_campaign["Margin_pct"] = np.where(
+        ts_campaign["Revenue"] > 0,
+        (ts_campaign["Revenue"] - ts_campaign["Spend"]) / ts_campaign["Revenue"],
+        np.nan
+    )
 
     spend_fig = go.Figure()
     spend_fig.add_trace(go.Scatter(
@@ -383,13 +388,28 @@ def main():
             y=ts_campaign["Revenue_per_Event"],
             name="Revenue / Event",
             mode="lines+markers",
-            line=dict(color="#f59e0b", dash="dot"),
+            line=dict(color="#f59e0b", dash="dot")
+        ))
+    if ts_campaign["Margin_pct"].notna().any():
+        efficiency_fig.add_trace(go.Scatter(
+            x=ts_campaign["period"],
+            y=ts_campaign["Margin_pct"],
+            name="Margin %",
+            mode="lines+markers",
+            line=dict(color="#14b8a6", dash="dash"),
             yaxis="y2"
         ))
-        efficiency_fig.update_layout(
-            yaxis2=dict(overlaying="y", side="right", title="Revenue / Event")
-        )
-    efficiency_fig.update_layout(height=240, margin=dict(l=0, r=0, t=40, b=0), yaxis_title="CPR", title="Efficiency (CPR + Revenue / Event)")
+    left_axis_title = "CPR / Revenue per Event" if rpl_col else "CPR"
+    chart_title = "Efficiency (CPR + Revenue / Event + Margin %)" if rpl_col else "Efficiency (CPR + Margin %)"
+    efficiency_fig.update_layout(
+        height=240,
+        margin=dict(l=0, r=0, t=40, b=0),
+        yaxis_title=left_axis_title,
+        yaxis=dict(tickprefix="$"),
+        yaxis2=dict(overlaying="y", side="right", title="Margin %", tickformat=".0%"),
+        title=chart_title,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
 
     col_a, col_b = st.columns([1.25, 1])
     with col_a:
