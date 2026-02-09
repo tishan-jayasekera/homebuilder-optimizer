@@ -17,7 +17,7 @@ root = Path(__file__).parent.parent
 if str(root) not in sys.path:
     sys.path.insert(0, str(root))
 
-from src.data_loader import load_events
+from src.data_loader import load_events, load_media_raw
 from src.normalization import normalize_events
 
 st.set_page_config(page_title="Postcode Opportunity Insights", page_icon="📍", layout="wide")
@@ -60,6 +60,17 @@ def load_data(events_file):
         return None
     events = load_events(events_file)
     return normalize_events(events) if events is not None else None
+
+
+@st.cache_data(show_spinner=False)
+def load_media_data(media_file):
+    if media_file is None:
+        return None
+    try:
+        media_file.seek(0)
+    except Exception:
+        pass
+    return load_media_raw(media_file)
 
 
 def _find_col(columns, candidates):
@@ -178,6 +189,8 @@ def main():
         st.warning("⚠️ Please upload Events data on the Home page.")
         st.page_link("app.py", label="← Go to Home", icon="🏠")
         return
+    media_file = st.session_state.get("media_file")
+    media_raw = load_media_data(media_file)
 
     postcode_col = _find_col(events.columns, ["Postcode"])
     suburb_col = _find_col(events.columns, ["Suburb"])
@@ -276,6 +289,7 @@ def main():
         return
 
     campaign_col = _find_col(df.columns, ["utm_campaign", "utm_key", "ad_key"])
+    utm_campaign_col = _find_col(df.columns, ["utm_campaign"])
     spend_col = _find_col(df.columns, ["MediaCost_referral_event", "MediaCost_builder_touch", "MediaCost_origin_lead"])
     original_deal_col = _find_col(
         df.columns,
@@ -2169,11 +2183,14 @@ def main():
                 sorted(df[campaign_col].dropna().unique().tolist()),
                 key="campaign_tracker_pick"
             )
-            auto_lead_col = _find_col(df.columns, ["LeadId", "lead_id", "LeadID"])
+            auto_lead_col = _find_col(
+                df.columns,
+                ["LeadId", "lead_id", "LeadID", "Deals: Id", "Deals:Id", "Deal Id", "DealID", "Deals_Id", "Deal_ID"]
+            )
             auto_parent_col = _find_col(
                 df.columns,
                 ["ParentLeadId", "Parent_LeadId", "ParentLeadID", "ReferrerLeadId", "Referrer_LeadId",
-                 "RefLeadId", "ParentLead", "ReferrerLead"]
+                 "RefLeadId", "ParentLead", "ReferrerLead", "Original Deal ID", "Original DealId", "Original_Deal_ID"]
             )
             auto_adset_col = _find_col(
                 df.columns,
@@ -2378,6 +2395,258 @@ def main():
                             )
                             mix_fig.for_each_annotation(lambda a: a.update(text=a.text.replace("Metric=", "")))
                             st.plotly_chart(mix_fig, use_container_width=True, config={"displayModeBar": False})
+
+                st.markdown("**Media spend & FB lead conversion (media_raw_base_phase0)**")
+                if media_raw is None:
+                    st.caption("Upload media_raw_base_phase0 to enable media enrichment.")
+                else:
+                    media = media_raw.copy()
+                    report_col = _find_col(media.columns, ["Report: Date", "Report Date", "Report:Date", "Date"])
+                    spend_col_media = _find_col(
+                        media.columns,
+                        ["Cost: Amount spend", "Cost: Amount spent", "Cost: Amount Spent", "Amount Spent", "Spend"]
+                    )
+                    conv_col_media = _find_col(
+                        media.columns,
+                        [
+                            "Conversions: All On-Facebook Leads - Total",
+                            "Conversions: All On-Facebook Leads - Total (All)",
+                            "Conversions: All On-Facebook Leads - Total - All"
+                        ]
+                    )
+                    camp_col_media = _find_col(media.columns, ["Campaign: Campaign name"])
+                    ad_group_col_media = _find_col(media.columns, ["Ad group: Ad group name"])
+
+                    missing_cols = [c for c, v in {
+                        "Report: Date": report_col,
+                        "Cost: Amount spend": spend_col_media,
+                        "Conversions: All On-Facebook Leads - Total": conv_col_media,
+                        "Campaign: Campaign name": camp_col_media,
+                        "Ad group: Ad group name": ad_group_col_media
+                    }.items() if v is None]
+                    if missing_cols:
+                        st.caption("Media enrichment missing columns: " + ", ".join(missing_cols))
+                    elif not utm_campaign_col:
+                        st.caption("Media enrichment requires utm_campaign in Events data.")
+                    else:
+                        media[report_col] = pd.to_datetime(media[report_col], errors="coerce")
+                        media = media.dropna(subset=[report_col])
+                        media = media[
+                            (media[report_col] >= pd.Timestamp(start_d)) &
+                            (media[report_col] <= pd.Timestamp(end_d))
+                        ]
+                        media = media[media[camp_col_media].astype(str) == str(campaign_pick)]
+                        if adset_pick and adset_col:
+                            media = media[media[ad_group_col_media].astype(str) == str(adset_pick)]
+                        elif adset_pick and not adset_col:
+                            st.caption("Ad set filter requires an ad set column in Events data; showing campaign total.")
+
+                        if media.empty:
+                            st.caption("No media rows match the selected campaign/ad set in the chosen date range.")
+                        else:
+                            media[spend_col_media] = pd.to_numeric(media[spend_col_media], errors="coerce").fillna(0.0)
+                            media[conv_col_media] = pd.to_numeric(media[conv_col_media], errors="coerce").fillna(0.0)
+
+                            media_period = (
+                                media.assign(period=media[report_col].dt.to_period(trend_period).dt.start_time)
+                                .groupby("period", as_index=False)
+                                .agg(
+                                    Media_Spend=(spend_col_media, "sum"),
+                                    FB_Leads=(conv_col_media, "sum")
+                                )
+                            )
+
+                            event_period = (
+                                c_df.assign(period=c_df["event_date"].dt.to_period(trend_period).dt.start_time)
+                                .groupby("period")
+                                .apply(lambda g: pd.Series({"Qualified_Leads": _count_leads_refs(g)[0]}))
+                                .reset_index()
+                            )
+
+                            media_join = media_period.merge(event_period, on="period", how="outer").sort_values("period")
+                            for col in ["Media_Spend", "FB_Leads", "Qualified_Leads"]:
+                                if col in media_join.columns:
+                                    media_join[col] = media_join[col].fillna(0)
+                            media_join["Conversion_Rate"] = np.where(
+                                media_join["FB_Leads"] > 0,
+                                media_join["Qualified_Leads"] / media_join["FB_Leads"],
+                                np.nan
+                            )
+
+                            total_media_spend = media_join["Media_Spend"].sum()
+                            total_fb_leads = media_join["FB_Leads"].sum()
+                            total_qualified = media_join["Qualified_Leads"].sum()
+                            total_conv = _safe_div(total_qualified, total_fb_leads)
+                            st.caption(
+                                f"Spend: ${_fmt(total_media_spend)} · FB Leads: {_fmt(total_fb_leads)} · "
+                                f"Qualified Leads: {_fmt(total_qualified)} · Conversion: {_fmt(total_conv, fmt='{:.1%}')}"
+                            )
+
+                            st.dataframe(
+                                media_join.rename(columns={
+                                    "period": "Period",
+                                    "Media_Spend": "Media Spend",
+                                    "FB_Leads": "FB Leads",
+                                    "Qualified_Leads": "Qualified Leads",
+                                    "Conversion_Rate": "Conversion Rate"
+                                }),
+                                hide_index=True,
+                                use_container_width=True
+                            )
+
+                            conv_fig = go.Figure()
+                            conv_fig.add_trace(go.Bar(
+                                x=media_join["period"],
+                                y=media_join["Media_Spend"],
+                                name="Media Spend",
+                                marker_color="#6366f1"
+                            ))
+                            conv_fig.add_trace(go.Scatter(
+                                x=media_join["period"],
+                                y=media_join["Conversion_Rate"],
+                                name="Qualified / FB Leads",
+                                mode="lines+markers",
+                                yaxis="y2",
+                                line=dict(color="#22c55e")
+                            ))
+                            conv_fig.update_layout(
+                                height=260,
+                                margin=dict(l=0, r=0, t=30, b=0),
+                                yaxis_title="Spend",
+                                yaxis2=dict(
+                                    overlaying="y",
+                                    side="right",
+                                    tickformat=".0%",
+                                    title="Conversion Rate"
+                                ),
+                                title="Media spend vs conversion rate"
+                            )
+                            st.plotly_chart(conv_fig, use_container_width=True, config={"displayModeBar": False})
+
+                            st.markdown("**Lead → referral lag (media spend date → referral date)**")
+                            ref_df = c_df[c_df[ref_flag_col] == True].copy()
+                            ref_date_col = "RefDate" if "RefDate" in ref_df.columns else "event_date"
+                            ref_df["_ref_date"] = pd.to_datetime(ref_df[ref_date_col], errors="coerce")
+                            ref_df = ref_df.dropna(subset=["_ref_date"])
+                            ref_df = ref_df[
+                                (ref_df["_ref_date"] >= pd.Timestamp(start_d)) &
+                                (ref_df["_ref_date"] <= pd.Timestamp(end_d))
+                            ]
+
+                            if ref_df.empty or media.empty:
+                                st.caption("Not enough media/referral data to estimate lag.")
+                            else:
+                                if use_unique_ids and "_deal_id" in ref_df.columns:
+                                    ref_daily = (
+                                        ref_df.groupby(ref_df["_ref_date"].dt.normalize())["_deal_id"]
+                                        .nunique()
+                                        .reset_index(name="Referrals")
+                                    )
+                                elif lead_id_col and lead_id_col in ref_df.columns:
+                                    ref_daily = (
+                                        ref_df.groupby(ref_df["_ref_date"].dt.normalize())[lead_id_col]
+                                        .nunique()
+                                        .reset_index(name="Referrals")
+                                    )
+                                else:
+                                    ref_daily = (
+                                        ref_df.groupby(ref_df["_ref_date"].dt.normalize())
+                                        .size()
+                                        .reset_index(name="Referrals")
+                                    )
+                                ref_daily = ref_daily.rename(columns={"_ref_date": "date"})
+
+                                media_daily = (
+                                    media.assign(date=media[report_col].dt.normalize())
+                                    .groupby("date", as_index=False)[conv_col_media]
+                                    .sum()
+                                    .rename(columns={conv_col_media: "FB_Leads"})
+                                )
+
+                                leads_list = (
+                                    media_daily[media_daily["FB_Leads"] > 0]
+                                    .sort_values("date")[["date", "FB_Leads"]]
+                                    .values.tolist()
+                                )
+                                refs_list = (
+                                    ref_daily[ref_daily["Referrals"] > 0]
+                                    .sort_values("date")[["date", "Referrals"]]
+                                    .values.tolist()
+                                )
+
+                                def _compute_lag_stats(leads_in, refs_in):
+                                    if not leads_in or not refs_in:
+                                        return {}, 0, 0, 0
+                                    lead_idx = 0
+                                    lead_date, lead_remaining = leads_in[lead_idx]
+                                    lag_counts = {}
+                                    matched = 0
+                                    total_refs = int(sum(r[1] for r in refs_in))
+                                    total_leads = int(sum(l[1] for l in leads_in))
+                                    for ref_date, ref_count in refs_in:
+                                        remaining = int(ref_count)
+                                        while remaining > 0 and lead_idx < len(leads_in):
+                                            take = min(lead_remaining, remaining)
+                                            lag_days = (ref_date - lead_date).days
+                                            if lag_days < 0:
+                                                lag_days = 0
+                                            lag_counts[lag_days] = lag_counts.get(lag_days, 0) + take
+                                            matched += take
+                                            lead_remaining -= take
+                                            remaining -= take
+                                            if lead_remaining == 0:
+                                                lead_idx += 1
+                                                if lead_idx < len(leads_in):
+                                                    lead_date, lead_remaining = leads_in[lead_idx]
+                                        if lead_idx >= len(leads_in):
+                                            break
+                                    return lag_counts, matched, total_refs, total_leads
+
+                                lag_counts, matched_refs, total_refs, total_leads = _compute_lag_stats(leads_list, refs_list)
+                                if not lag_counts:
+                                    st.caption("Not enough matched leads/referrals to estimate lag.")
+                                else:
+                                    lag_df = (
+                                        pd.DataFrame({
+                                            "Lag_days": list(lag_counts.keys()),
+                                            "Referrals": list(lag_counts.values())
+                                        })
+                                        .sort_values("Lag_days")
+                                    )
+                                    total_matched = lag_df["Referrals"].sum()
+                                    avg_lag = (lag_df["Lag_days"] * lag_df["Referrals"]).sum() / total_matched
+
+                                    def _weighted_percentile(df_in, pct):
+                                        target = df_in["Referrals"].sum() * pct
+                                        running = 0
+                                        for _, row in df_in.iterrows():
+                                            running += row["Referrals"]
+                                            if running >= target:
+                                                return row["Lag_days"]
+                                        return df_in["Lag_days"].iloc[-1]
+
+                                    p50 = _weighted_percentile(lag_df, 0.5)
+                                    p90 = _weighted_percentile(lag_df, 0.9)
+                                    match_rate = _safe_div(matched_refs, total_refs)
+
+                                    st.caption(
+                                        f"Matched referrals: {matched_refs:,}/{total_refs:,} ({_fmt(match_rate, fmt='{:.0%}')}) · "
+                                        f"Avg lag: {avg_lag:.1f} days · Median: {p50} days · P90: {p90} days"
+                                    )
+
+                                    lag_fig = px.bar(
+                                        lag_df,
+                                        x="Lag_days",
+                                        y="Referrals",
+                                        title="Estimated lag distribution"
+                                    )
+                                    lag_fig.update_layout(
+                                        height=260,
+                                        margin=dict(l=0, r=0, t=40, b=0),
+                                        xaxis_title="Days from media spend to referral",
+                                        yaxis_title="Referrals (matched)"
+                                    )
+                                    st.plotly_chart(lag_fig, use_container_width=True, config={"displayModeBar": False})
                 if lead_id_col and parent_id_col:
                     parent_cols = [lead_id_col, campaign_col, lead_flag_col]
                     if adset_col and adset_col in df.columns:
@@ -2466,7 +2735,10 @@ def main():
                         if dup_leads or dup_refs:
                             st.caption(f"Duplicate IDs detected — leads: {dup_leads}, referrals: {dup_refs}. Consider de-duplicating by LeadId.")
                 else:
-                    st.caption("Lead → referral reconciliation requires LeadId and ParentLeadId/ReferrerLeadId columns.")
+                    st.caption(
+                        "Lead → referral reconciliation requires lead + parent IDs "
+                        "(LeadId/ParentLeadId/ReferrerLeadId or Deals: Id + Original Deal ID)."
+                    )
 
                 tmp = c_df.assign(period=c_df["event_date"].dt.to_period(trend_period).dt.start_time)
                 def _detail_summary(g):
@@ -2538,6 +2810,376 @@ def main():
                 eff_title = "Ad set efficiency trend" if scope_label == "ad set" else "Campaign efficiency trend"
                 c_eff.update_layout(height=200, margin=dict(l=0, r=0, t=30, b=0), yaxis_title="Value", title=eff_title)
                 st.plotly_chart(c_eff, use_container_width=True, config={"displayModeBar": False})
+
+                st.markdown("**Empirical lag estimate (media spend → referrals)**")
+                if media_raw is None:
+                    st.caption("Upload media_raw_base_phase0 to enable lag estimation.")
+                else:
+                    media = media_raw.copy()
+                    report_col = _find_col(media.columns, ["Report: Date", "Report Date", "Report:Date", "Date"])
+                    spend_col_media = _find_col(
+                        media.columns,
+                        ["Cost: Amount spend", "Cost: Amount spent", "Cost: Amount Spent", "Amount Spent", "Spend"]
+                    )
+                    conv_col_media = _find_col(
+                        media.columns,
+                        [
+                            "Conversions: All On-Facebook Leads - Total",
+                            "Conversions: All On-Facebook Leads - Total (All)",
+                            "Conversions: All On-Facebook Leads - Total - All"
+                        ]
+                    )
+                    camp_col_media = _find_col(media.columns, ["Campaign: Campaign name"])
+                    ad_group_col_media = _find_col(media.columns, ["Ad group: Ad group name"])
+
+                    missing_cols = [c for c, v in {
+                        "Report: Date": report_col,
+                        "Cost: Amount spend": spend_col_media,
+                        "Conversions: All On-Facebook Leads - Total": conv_col_media,
+                        "Campaign: Campaign name": camp_col_media,
+                        "Ad group: Ad group name": ad_group_col_media
+                    }.items() if v is None]
+                    if missing_cols:
+                        st.caption("Lag estimation missing columns: " + ", ".join(missing_cols))
+                    else:
+                        media[report_col] = pd.to_datetime(media[report_col], errors="coerce")
+                        media = media.dropna(subset=[report_col])
+                        media = media[
+                            (media[report_col] >= pd.Timestamp(start_d)) &
+                            (media[report_col] <= pd.Timestamp(end_d))
+                        ]
+                        media = media[media[camp_col_media].astype(str) == str(campaign_pick)]
+                        if adset_pick and adset_col:
+                            media = media[media[ad_group_col_media].astype(str) == str(adset_pick)]
+                        if media.empty:
+                            st.caption("No media rows match the selected campaign/ad set in the chosen date range.")
+                        else:
+                            media[spend_col_media] = pd.to_numeric(media[spend_col_media], errors="coerce").fillna(0.0)
+                            media[conv_col_media] = pd.to_numeric(media[conv_col_media], errors="coerce").fillna(0.0)
+
+                            ref_df = c_df[c_df[ref_flag_col] == True].copy()
+                            ref_date_col = "RefDate" if "RefDate" in ref_df.columns else "event_date"
+                            ref_df["_ref_date"] = pd.to_datetime(ref_df[ref_date_col], errors="coerce")
+                            ref_df = ref_df.dropna(subset=["_ref_date"])
+                            ref_df = ref_df[
+                                (ref_df["_ref_date"] >= pd.Timestamp(start_d)) &
+                                (ref_df["_ref_date"] <= pd.Timestamp(end_d))
+                            ]
+                            if ref_df.empty:
+                                st.caption("No referral rows in the selected date range.")
+                            else:
+                                date_index = pd.date_range(start=start_d, end=end_d, freq="D")
+                                media_daily = (
+                                    media.assign(date=media[report_col].dt.normalize())
+                                    .groupby("date", as_index=False)
+                                    .agg(
+                                        Spend=(spend_col_media, "sum"),
+                                        FB_Leads=(conv_col_media, "sum")
+                                    )
+                                    .set_index("date")
+                                    .reindex(date_index, fill_value=0.0)
+                                )
+                                if use_unique_ids and "_deal_id" in ref_df.columns:
+                                    ref_daily = (
+                                        ref_df.groupby(ref_df["_ref_date"].dt.normalize())["_deal_id"]
+                                        .nunique()
+                                        .reindex(date_index, fill_value=0)
+                                    )
+                                elif lead_id_col and lead_id_col in ref_df.columns:
+                                    ref_daily = (
+                                        ref_df.groupby(ref_df["_ref_date"].dt.normalize())[lead_id_col]
+                                        .nunique()
+                                        .reindex(date_index, fill_value=0)
+                                    )
+                                else:
+                                    ref_daily = (
+                                        ref_df.groupby(ref_df["_ref_date"].dt.normalize())
+                                        .size()
+                                        .reindex(date_index, fill_value=0)
+                                    )
+
+                                signal_choice = st.radio(
+                                    "Media signal for lag estimate",
+                                    ["FB Leads", "Spend"],
+                                    horizontal=True,
+                                    key="lag_signal_choice"
+                                )
+                                max_lag = st.slider("Max lag (days)", 0, 90, 30, step=1, key="lag_max_days")
+                                smooth_window = st.selectbox(
+                                    "Smoothing window (days)",
+                                    [1, 3, 7],
+                                    index=1,
+                                    key="lag_smooth_window"
+                                )
+
+                                media_signal = media_daily["FB_Leads"] if signal_choice == "FB Leads" else media_daily["Spend"]
+                                referrals_signal = ref_daily
+
+                                if smooth_window > 1:
+                                    media_signal = media_signal.rolling(smooth_window, min_periods=1).mean()
+                                    referrals_signal = referrals_signal.rolling(smooth_window, min_periods=1).mean()
+
+                                if len(date_index) <= max_lag + 7:
+                                    st.caption("Short date range: lag estimates may be unreliable due to censoring.")
+
+                                lags = []
+                                corrs = []
+                                for lag in range(0, max_lag + 1):
+                                    if lag == 0:
+                                        x = media_signal.values
+                                        y = referrals_signal.values
+                                    else:
+                                        x = media_signal.values[:-lag]
+                                        y = referrals_signal.values[lag:]
+                                    if len(x) < 7 or np.nanstd(x) == 0 or np.nanstd(y) == 0:
+                                        corr = np.nan
+                                    else:
+                                        corr = np.corrcoef(x, y)[0, 1]
+                                    lags.append(lag)
+                                    corrs.append(corr)
+                                corr_df = pd.DataFrame({"Lag_days": lags, "Correlation": corrs})
+                                if corr_df["Correlation"].notna().any():
+                                    best = corr_df.loc[corr_df["Correlation"].idxmax()]
+                                    best_lag = int(best["Lag_days"])
+                                    st.caption(f"Best lag: {int(best['Lag_days'])} days (corr {best['Correlation']:.2f}).")
+                                    st.markdown(
+                                        f"""
+                                        <div class="explainer">
+                                            <div class="explainer-title">How to read this</div>
+                                            <div class="explainer-text">
+                                                The peak shows the most likely delay between media activity and referral lift.
+                                                For this selection, referrals tend to show up about <b>{best_lag} days</b> after spend.
+                                                Use that window to set expectations and avoid judging performance too early.
+                                            </div>
+                                        </div>
+                                        """,
+                                        unsafe_allow_html=True
+                                    )
+                                    top3 = corr_df.dropna().sort_values("Correlation", ascending=False).head(3)
+                                    st.dataframe(top3, hide_index=True, use_container_width=True)
+                                    corr_fig = px.line(
+                                        corr_df,
+                                        x="Lag_days",
+                                        y="Correlation",
+                                        title="Lag correlation curve"
+                                    )
+                                    corr_fig.update_layout(
+                                        height=260,
+                                        margin=dict(l=0, r=0, t=40, b=0),
+                                        xaxis_title="Lag (days)",
+                                        yaxis_title="Correlation"
+                                    )
+                                    st.plotly_chart(corr_fig, use_container_width=True, config={"displayModeBar": False})
+                                else:
+                                    st.caption("Not enough variation to compute lag correlation.")
+
+                st.markdown("**Budget deployment → referral peak**")
+                st.markdown("""
+                <div class="explainer">
+                    <div class="explainer-title">What this shows</div>
+                    <div class="explainer-text">
+                        Set a budget, then see when that budget is fully deployed and how many days later referrals peak.
+                        This gives a practical “time‑to‑impact” window for a spend decision.
+                        The budget slider defaults to <b>50% of the observed spend</b> in the selected date range
+                        (min $50 step, max = total observed spend), so it is grounded in your empirical spend history.
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+                if media_raw is None:
+                    st.caption("Upload media_raw_base_phase0 to enable budget analysis.")
+                else:
+                    media = media_raw.copy()
+                    report_col = _find_col(media.columns, ["Report: Date", "Report Date", "Report:Date", "Date"])
+                    spend_col_media = _find_col(
+                        media.columns,
+                        ["Cost: Amount spend", "Cost: Amount spent", "Cost: Amount Spent", "Amount Spent", "Spend"]
+                    )
+                    camp_col_media = _find_col(media.columns, ["Campaign: Campaign name"])
+                    ad_group_col_media = _find_col(media.columns, ["Ad group: Ad group name"])
+
+                    missing_cols = [c for c, v in {
+                        "Report: Date": report_col,
+                        "Cost: Amount spend": spend_col_media,
+                        "Campaign: Campaign name": camp_col_media,
+                        "Ad group: Ad group name": ad_group_col_media
+                    }.items() if v is None]
+                    if missing_cols:
+                        st.caption("Budget analysis missing columns: " + ", ".join(missing_cols))
+                    else:
+                        media[report_col] = pd.to_datetime(media[report_col], errors="coerce")
+                        media = media.dropna(subset=[report_col])
+                        media = media[
+                            (media[report_col] >= pd.Timestamp(start_d)) &
+                            (media[report_col] <= pd.Timestamp(end_d))
+                        ]
+                        media = media[media[camp_col_media].astype(str) == str(campaign_pick)]
+                        if adset_pick and adset_col:
+                            media = media[media[ad_group_col_media].astype(str) == str(adset_pick)]
+                        if media.empty:
+                            st.caption("No media rows match the selected campaign/ad set in the chosen date range.")
+                        else:
+                            media[spend_col_media] = pd.to_numeric(media[spend_col_media], errors="coerce").fillna(0.0)
+                            date_index = pd.date_range(start=start_d, end=end_d, freq="D")
+                            spend_daily = (
+                                media.assign(date=media[report_col].dt.normalize())
+                                .groupby("date", as_index=False)[spend_col_media]
+                                .sum()
+                                .rename(columns={spend_col_media: "Spend"})
+                                .set_index("date")
+                                .reindex(date_index, fill_value=0.0)
+                            )
+                            spend_daily["Cumulative_Spend"] = spend_daily["Spend"].cumsum()
+                            total_spend = float(spend_daily["Cumulative_Spend"].iloc[-1])
+                            if total_spend <= 0:
+                                st.caption("No spend recorded for this selection.")
+                            else:
+                                step = max(50.0, total_spend / 200)
+                                budget = st.slider(
+                                    "Budget to evaluate",
+                                    0.0,
+                                    float(total_spend),
+                                    float(total_spend * 0.5),
+                                    step=float(step),
+                                    key="budget_peak_slider"
+                                )
+                                budget_hit_date = None
+                                if budget > 0:
+                                    hit_idx = spend_daily[spend_daily["Cumulative_Spend"] >= budget]
+                                    if not hit_idx.empty:
+                                        budget_hit_date = hit_idx.index[0]
+                                if budget_hit_date is None:
+                                    st.caption("Budget not fully deployed within the selected date range.")
+                                else:
+                                    ref_df = c_df[c_df[ref_flag_col] == True].copy()
+                                    ref_date_col = "RefDate" if "RefDate" in ref_df.columns else "event_date"
+                                    ref_df["_ref_date"] = pd.to_datetime(ref_df[ref_date_col], errors="coerce")
+                                    ref_df = ref_df.dropna(subset=["_ref_date"])
+                                    ref_df = ref_df[
+                                        (ref_df["_ref_date"] >= pd.Timestamp(start_d)) &
+                                        (ref_df["_ref_date"] <= pd.Timestamp(end_d))
+                                    ]
+                                    if ref_df.empty:
+                                        st.caption("No referrals in the selected date range.")
+                                    else:
+                                        if use_unique_ids and "_deal_id" in ref_df.columns:
+                                            ref_daily = (
+                                                ref_df.groupby(ref_df["_ref_date"].dt.normalize())["_deal_id"]
+                                                .nunique()
+                                                .reindex(date_index, fill_value=0)
+                                            )
+                                        elif lead_id_col and lead_id_col in ref_df.columns:
+                                            ref_daily = (
+                                                ref_df.groupby(ref_df["_ref_date"].dt.normalize())[lead_id_col]
+                                                .nunique()
+                                                .reindex(date_index, fill_value=0)
+                                            )
+                                        else:
+                                            ref_daily = (
+                                                ref_df.groupby(ref_df["_ref_date"].dt.normalize())
+                                                .size()
+                                                .reindex(date_index, fill_value=0)
+                                            )
+
+                                        smooth_window = st.selectbox(
+                                            "Referral smoothing (days)",
+                                            [1, 3, 7],
+                                            index=1,
+                                            key="budget_peak_smooth"
+                                        )
+                                        if smooth_window > 1:
+                                            ref_daily = ref_daily.rolling(smooth_window, min_periods=1).mean()
+
+                                        post_budget = ref_daily.loc[budget_hit_date:]
+                                        if post_budget.empty or post_budget.sum() == 0:
+                                            st.caption("No referrals after budget was fully deployed.")
+                                        else:
+                                            peak_date = post_budget.idxmax()
+                                            peak_value = post_budget.loc[peak_date]
+                                            days_to_peak = (peak_date - budget_hit_date).days
+                                            st.caption(
+                                                f"So what: after the budget is fully deployed, "
+                                                f"referrals peak about {days_to_peak} days later "
+                                                f"(budget on {budget_hit_date.date()}, peak on {peak_date.date()})."
+                                            )
+
+                                            peak_fig = go.Figure()
+                                            peak_fig.add_trace(go.Scatter(
+                                                x=spend_daily.index,
+                                                y=spend_daily["Cumulative_Spend"],
+                                                name="Cumulative Spend",
+                                                mode="lines",
+                                                line=dict(color="#6366f1")
+                                            ))
+                                            peak_fig.add_trace(go.Bar(
+                                                x=ref_daily.index,
+                                                y=ref_daily.values,
+                                                name="Referrals",
+                                                marker_color="#14b8a6",
+                                                yaxis="y2",
+                                                opacity=0.6
+                                            ))
+                                            budget_hit_dt = pd.Timestamp(budget_hit_date).to_pydatetime()
+                                            peak_dt = pd.Timestamp(peak_date).to_pydatetime()
+                                            peak_fig.add_shape(
+                                                type="line",
+                                                x0=budget_hit_dt,
+                                                x1=budget_hit_dt,
+                                                y0=0,
+                                                y1=1,
+                                                xref="x",
+                                                yref="paper",
+                                                line=dict(color="#f59e0b", dash="dash")
+                                            )
+                                            peak_fig.add_annotation(
+                                                x=budget_hit_dt,
+                                                y=1,
+                                                xref="x",
+                                                yref="paper",
+                                                text="Budget deployed",
+                                                showarrow=False,
+                                                yanchor="bottom",
+                                                font=dict(color="#f59e0b")
+                                            )
+                                            peak_fig.add_shape(
+                                                type="line",
+                                                x0=peak_dt,
+                                                x1=peak_dt,
+                                                y0=0,
+                                                y1=1,
+                                                xref="x",
+                                                yref="paper",
+                                                line=dict(color="#22c55e", dash="dot")
+                                            )
+                                            peak_fig.add_annotation(
+                                                x=peak_dt,
+                                                y=1,
+                                                xref="x",
+                                                yref="paper",
+                                                text="Referral peak",
+                                                showarrow=False,
+                                                yanchor="bottom",
+                                                font=dict(color="#22c55e")
+                                            )
+                                            peak_fig.add_hline(
+                                                y=budget,
+                                                line_dash="dot",
+                                                line_color="#f59e0b",
+                                                annotation_text="Budget",
+                                                annotation_position="bottom left"
+                                            )
+                                            peak_fig.update_layout(
+                                                height=280,
+                                                margin=dict(l=0, r=0, t=30, b=0),
+                                                yaxis_title="Cumulative Spend",
+                                                yaxis2=dict(
+                                                    overlaying="y",
+                                                    side="right",
+                                                    title="Referrals",
+                                                    rangemode="tozero"
+                                                ),
+                                                title="Budget deployment vs referral peak"
+                                            )
+                                            st.plotly_chart(peak_fig, use_container_width=True, config={"displayModeBar": False})
 
             st.markdown("**Campaigns at risk (slow to first lead)**")
             st.dataframe(
