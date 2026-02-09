@@ -19,9 +19,8 @@ if str(ROOT) not in sys.path:
 from src.data_loader import load_events, load_origin_perf, load_media_raw
 from src.normalization import normalize_events
 from src.optimization_engine import ReferralOptimizationEngine
-from src.network_optimization import build_prescriptive_plan, compute_lag_metrics_simple, analyze_network_leverage, calculate_shortfalls
 from src.attribution_engine import FullFunnelAttributor
-from src.mathematical_optimizer import MathematicalOptimizer, OptimizationConfig, quick_optimize
+from src.campaign_command import CampaignCommandEngine
 
 
 st.set_page_config(
@@ -369,39 +368,6 @@ else:
 
 st.markdown('</div>', unsafe_allow_html=True)
 
-# Prescriptive Strategy
-st.markdown('<div class="section-card">', unsafe_allow_html=True)
-st.markdown("**Prescriptive Strategy**")
-events_for_plan = events.copy()
-lag_simple = compute_lag_metrics_simple(events_for_plan)
-leverage_df = analyze_network_leverage(events_for_plan)
-shortfalls_df = calculate_shortfalls(events_for_plan, total_events_df=events_for_plan)
-
-plan_df, timing_df = build_prescriptive_plan(
-    events_df=events_for_plan,
-    leverage_df=leverage_df,
-    shortfalls_df=shortfalls_df,
-    media_raw_df=None,
-    lag_metrics=lag_simple,
-)
-
-if plan_df.empty:
-    st.caption("No prescriptive recommendations available yet.")
-    st.caption(f"Shortfalls rows: {len(shortfalls_df)} | Leverage rows: {len(leverage_df)}")
-else:
-    plan_df["Required Budget"] = plan_df["Required Budget"].map(lambda v: f"${v:,.0f}")
-    plan_df["Transfer Rate"] = plan_df["Transfer Rate"].map(lambda v: f"{v:.0%}")
-    plan_df["eCPR"] = plan_df["eCPR"].map(lambda v: f"${v:,.0f}")
-    plan_df["Required Daily Leads"] = plan_df["Required Daily Leads"].map(lambda v: f"{v:.2f}")
-    plan_df["Expected Pace Factor"] = plan_df["Expected Pace Factor"].map(lambda v: f"{v:.2f}" if pd.notna(v) else "-")
-    st.dataframe(plan_df, hide_index=True, use_container_width=True)
-
-if not timing_df.empty:
-    st.markdown("**Media Timing Alerts**")
-    st.dataframe(timing_df, hide_index=True, use_container_width=True)
-
-st.markdown('</div>', unsafe_allow_html=True)
-
 # ============================================
 # NEW SECTION: Full Funnel Attribution Analysis
 # ============================================
@@ -466,90 +432,6 @@ if not attribution_df.empty:
 
 st.markdown('</div>', unsafe_allow_html=True)
 
-# ============================================
-# NEW SECTION: Mathematical Optimization
-# ============================================
-st.markdown('<div class="section-card">', unsafe_allow_html=True)
-st.markdown("**🧮 Mathematical Spend Optimization**")
-
-with st.expander("⚙️ Optimization Parameters", expanded=False):
-    opt_col1, opt_col2, opt_col3 = st.columns(3)
-    with opt_col1:
-        opt_budget = st.number_input("Total Budget ($)", min_value=1000, max_value=1000000,
-                                     value=50000, step=5000, key="opt_budget")
-    with opt_col2:
-        opt_horizon = st.number_input("Horizon (days)", min_value=7, max_value=90,
-                                      value=30, step=7, key="opt_horizon")
-    with opt_col3:
-        opt_pacing_cap = st.slider("Pacing Cap", min_value=1.0, max_value=1.5,
-                                   value=1.2, step=0.05, key="opt_pacing")
-    st.divider()
-    limit_col1, limit_col2, limit_col3 = st.columns(3)
-    with limit_col1:
-        opt_max_sources = st.number_input("Max Sources", min_value=5, max_value=100, value=25, step=5, key="opt_max_sources")
-    with limit_col2:
-        opt_max_builders = st.number_input("Max Builders", min_value=5, max_value=100, value=25, step=5, key="opt_max_builders")
-    with limit_col3:
-        opt_max_periods = st.number_input("Max Periods (days)", min_value=7, max_value=90, value=30, step=7, key="opt_max_periods")
-
-if st.button("🚀 Run Optimization", key="run_optimization"):
-    with st.spinner("Solving optimization problem..."):
-        try:
-            result = quick_optimize(
-                events,
-                total_budget=opt_budget,
-                horizon_days=opt_horizon,
-                max_sources=opt_max_sources,
-                max_builders=opt_max_builders,
-                max_periods=opt_max_periods
-            )
-
-            if result.status.value == "optimal":
-                st.success(f"✅ Optimization complete! System CPR: ${result.system_cpr:,.2f}")
-
-                # Summary metrics
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Total Spend", f"${result.total_spend:,.0f}")
-                m2.metric("Expected Referrals", f"{result.total_expected_referrals:,.0f}")
-                m3.metric("Budget Utilization", f"{result.budget_utilization:.0%}")
-                m4.metric("Solve Time", f"{result.solve_time_seconds:.2f}s")
-
-                # Allocations table
-                if result.allocations:
-                    alloc_df = pd.DataFrame([
-                        {
-                            "Source": a.source,
-                            "Target": a.target,
-                            "Period": f"Day {a.period}",
-                            "Amount": f"${a.amount:,.0f}",
-                            "Expected Refs": f"{a.expected_referrals:.1f}",
-                            "Priority": a.priority
-                        }
-                        for a in result.allocations[:20]
-                    ])
-                    st.markdown("**Top Spend Allocations**")
-                    st.dataframe(alloc_df, use_container_width=True, hide_index=True)
-
-                # Timing alerts
-                if result.timing_alerts:
-                    st.markdown("**⏰ Timing Alerts**")
-                    for alert in result.timing_alerts[:5]:
-                        if alert.urgency == "critical":
-                            st.error(f"🚨 {alert.message}")
-                        elif alert.urgency == "warning":
-                            st.warning(f"⚠️ {alert.message}")
-                        else:
-                            st.info(f"ℹ️ {alert.message}")
-            else:
-                st.error(f"Optimization failed: {result.solver_message}")
-
-        except ImportError:
-            st.warning("⚠️ CVXPY not installed. Run: `pip install cvxpy`")
-        except Exception as e:
-            st.error(f"Error: {str(e)}")
-
-st.markdown('</div>', unsafe_allow_html=True)
-
 # Spikes table
 st.markdown('<div class="section-card">', unsafe_allow_html=True)
 st.markdown("**Spike Log**")
@@ -566,29 +448,356 @@ else:
 
 st.markdown('</div>', unsafe_allow_html=True)
 
-# Pacing actions
+# ============================================
+# SECTION 2: CAMPAIGN COMMAND CENTER
+# ============================================
 st.markdown('<div class="section-card">', unsafe_allow_html=True)
-st.markdown("**Pacing-Aware Media Timing**")
-builder_pacing = engine.compute_builder_pacing()
-if builder_pacing.empty:
-    st.caption("No builder pacing targets available.")
+st.markdown("**🎯 Campaign Command Center**")
+st.caption("Shortfall triage → Direct vs Network decision → Budget-constrained allocation → Lead reconciliation")
+
+with st.sidebar:
+    st.markdown("---")
+    st.subheader("Campaign Command")
+    cmd_budget = st.number_input(
+        "Available Budget ($)", min_value=1000, max_value=5_000_000,
+        value=50_000, step=5_000, key="cmd_budget",
+    )
+
+_cmd_engine = CampaignCommandEngine(
+    events_df=events,
+    media_raw_df=media_raw,
+    budget=cmd_budget,
+)
+_cmd_plan = _cmd_engine.generate_plan()
+
+if not _cmd_plan.summary or "error" in _cmd_plan.summary:
+    st.caption("No campaign targets found. Ensure LeadTarget_from_job and Dest_BuilderRegionKey exist in data.")
 else:
-    near_cap = builder_pacing[builder_pacing["Pacing_Factor"] >= 1.15].copy()
-    under = builder_pacing[builder_pacing["Pacing_Factor"] < 0.8].copy()
-    if not near_cap.empty:
-        near_cap = near_cap.sort_values("Pacing_Factor", ascending=False)
-        near_cap["Action"] = "Soft Pause / Reduce Daily Budget"
-        st.markdown("**Builders Near Capacity**")
-        st.dataframe(near_cap[["Builder", "Pacing_Factor", "Action"]], hide_index=True, use_container_width=True)
-    if not under.empty:
-        under = under.sort_values("Pacing_Factor", ascending=True)
-        under["Action"] = "Increase Spend (fastest lag UTMs below)"
-        st.markdown("**Builders Under-Pacing**")
-        st.dataframe(under[["Builder", "Pacing_Factor", "Action"]], hide_index=True, use_container_width=True)
-        lag_by_ad = engine.compute_media_lag_by_ad_key(top_n=3)
-        if not lag_by_ad.empty:
-            st.caption("Top 3 ad_key by fastest media-to-lead lag")
-            st.dataframe(lag_by_ad, hide_index=True, use_container_width=True)
+    st.markdown(
+        """
+<style>
+.critical-badge { background: #FEE2E2; color: #991B1B; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; }
+.atrisk-badge { background: #FEF3C7; color: #92400E; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; }
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+
+    summary = _cmd_plan.summary
+    total_campaigns = summary.get("total_campaigns", 0)
+    with_shortfall = summary.get("campaigns_with_shortfall", 0)
+    critical = summary.get("campaigns_critical", 0)
+    at_risk = summary.get("campaigns_at_risk", 0)
+    total_shortfall = summary.get("total_shortfall_leads", 0.0)
+    required_budget = summary.get("budget_required_full", 0.0)
+    budget_gap = summary.get("budget_gap_full", 0.0)
+    planned_spend = summary.get("total_planned_spend", 0.0)
+    budget_remaining = summary.get("budget_remaining", 0.0)
+    blended_cpr = summary.get("blended_cpr", 0.0)
+    direct_spend = summary.get("direct_spend", 0.0)
+    network_spend = summary.get("network_spend", 0.0)
+    global_lag = summary.get("global_lag_days", 0.0)
+    earliest_last_spend = summary.get("earliest_last_spend_date")
+    min_effective_window = summary.get("min_effective_window_days")
+    total_spend = max(planned_spend, 0.0)
+
+    if total_spend > 0:
+        direct_pct = direct_spend / total_spend
+        network_pct = network_spend / total_spend
+    else:
+        direct_pct = 0.0
+        network_pct = 0.0
+
+    if earliest_last_spend is not None and pd.notna(earliest_last_spend):
+        spend_by_display = pd.to_datetime(earliest_last_spend).strftime("%Y-%m-%d")
+    else:
+        spend_by_display = "-"
+
+    metric_cols = st.columns(5)
+    with metric_cols[0]:
+        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+        st.markdown('<div class="metric-label">Campaigns in Shortfall</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-value">{with_shortfall} / {total_campaigns}</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="metric-sub"><span class="critical-badge">{critical} Critical</span> '
+            f'<span class="atrisk-badge">{at_risk} At Risk</span></div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown('</div>', unsafe_allow_html=True)
+    with metric_cols[1]:
+        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+        st.markdown('<div class="metric-label">Total Shortfall</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-value">{total_shortfall:,.0f} leads</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+    with metric_cols[2]:
+        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+        st.markdown('<div class="metric-label">Planned Spend</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-value">{format_currency(planned_spend)}</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="metric-sub">{format_currency(budget_remaining)} remaining · '
+            f'{format_currency(required_budget)} required</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown('</div>', unsafe_allow_html=True)
+    with metric_cols[3]:
+        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+        st.markdown('<div class="metric-label">Blended eCPR</div>', unsafe_allow_html=True)
+        blended_display = format_currency(blended_cpr) if blended_cpr else "-"
+        st.markdown(f'<div class="metric-value">{blended_display}</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+    with metric_cols[4]:
+        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+        st.markdown('<div class="metric-label">Spend Mix</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-value">{direct_pct:.0%} / {network_pct:.0%}</div>', unsafe_allow_html=True)
+        st.markdown('<div class="metric-sub">Direct / Network</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    secondary_cols = st.columns(3)
+    with secondary_cols[0]:
+        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+        st.markdown('<div class="metric-label">Required Budget (Full Cover)</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-value">{format_currency(required_budget)}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-sub">Gap vs Available: {format_currency(budget_gap)}</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+    with secondary_cols[1]:
+        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+        st.markdown('<div class="metric-label">Spend By (Earliest)</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-value">{spend_by_display}</div>', unsafe_allow_html=True)
+        window_display = f"{min_effective_window:.0f} days" if min_effective_window is not None and pd.notna(min_effective_window) else "-"
+        st.markdown(f'<div class="metric-sub">Min effective window: {window_display}</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+    with secondary_cols[2]:
+        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+        st.markdown('<div class="metric-label">Median Referral Lag</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-value">{global_lag:.0f} days</div>', unsafe_allow_html=True)
+        st.markdown('<div class="metric-sub">Lag reduces effective spend window</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    if not _cmd_plan.timing_alerts.empty:
+        for _, alert in _cmd_plan.timing_alerts[_cmd_plan.timing_alerts["Severity"] == "Critical"].iterrows():
+            st.error(f"**{alert['Campaign']}** — {alert['Message']}")
+        for _, alert in _cmd_plan.timing_alerts[_cmd_plan.timing_alerts["Severity"] == "Warning"].iterrows():
+            st.warning(f"**{alert['Campaign']}** — {alert['Message']}")
+
+    timing_window_df = _cmd_plan.status_table.copy()
+    if not timing_window_df.empty:
+        timing_window_df = timing_window_df[timing_window_df["shortfall"] > 0].copy()
+        if not timing_window_df.empty:
+            timing_window_df["Effective Spend Window"] = (timing_window_df["days_remaining"] - global_lag).clip(lower=0)
+            timing_window_df["Last Spend Date"] = timing_window_df["job_end"] - pd.Timedelta(days=global_lag)
+            timing_window_df = timing_window_df.sort_values("Effective Spend Window")
+            timing_window_df = timing_window_df.rename(columns={
+                "campaign": "Campaign",
+                "shortfall": "Shortfall",
+                "pace_status": "Pace Status",
+                "days_remaining": "Days Left",
+            })
+            st.markdown("**Spend Timing Window (Shortfall Campaigns)**")
+            st.dataframe(
+                timing_window_df[[
+                    "Campaign",
+                    "Shortfall",
+                    "Pace Status",
+                    "Days Left",
+                    "Effective Spend Window",
+                    "Last Spend Date",
+                ]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "Shortfall Triage",
+        "Direct vs Network",
+        "Allocation Plan",
+        "Lead Reconciliation",
+    ])
+
+    with tab1:
+        status_df = _cmd_plan.status_table.copy()
+        if status_df.empty:
+            st.caption("No campaign status available.")
+        else:
+            lag_series = status_df["lag_days"] if "lag_days" in status_df.columns else np.nan
+            effective_series = status_df["effective_days_remaining"] if "effective_days_remaining" in status_df.columns else np.nan
+            triage_df = pd.DataFrame({
+                "Campaign": status_df["campaign"],
+                "Target": status_df["lead_target"],
+                "Actual": status_df["leads_actual"],
+                "Proj. Shortfall": status_df["shortfall"],
+                "Lag (d)": lag_series,
+                "Eff. Days Left": effective_series,
+                "Actual Pace/d": status_df["actual_pace"],
+                "Required Pace/d": status_df["required_pace"],
+                "Pace Ratio": status_df["pace_ratio"].map(lambda v: f"{v:.2f}x"),
+                "Status": status_df["pace_status"],
+                "Days Left": status_df["days_remaining"],
+                "Urgency": status_df["urgency_score"],
+            })
+            st.dataframe(triage_df, use_container_width=True, hide_index=True)
+            st.caption("Pace ratio below 1.0 means current pace is behind required pace.")
+
+            top_shortfall = status_df[status_df["shortfall"] > 0].sort_values("shortfall", ascending=False).head(15)
+            if top_shortfall.empty:
+                st.caption("No shortfall campaigns to chart.")
+            else:
+                fig = go.Figure()
+                fig.add_trace(go.Bar(
+                    y=top_shortfall["campaign"],
+                    x=top_shortfall["required_pace"],
+                    orientation="h",
+                    name="Required Pace",
+                    marker_color="#E2E8F0",
+                ))
+                fig.add_trace(go.Bar(
+                    y=top_shortfall["campaign"],
+                    x=top_shortfall["actual_pace"],
+                    orientation="h",
+                    name="Actual Pace",
+                    marker_color="#3B82F6",
+                ))
+                fig.update_layout(
+                    barmode="overlay",
+                    height=360,
+                    margin=dict(l=10, r=10, t=30, b=10),
+                    xaxis_title="Leads per Day",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+    with tab2:
+        compare_df = _cmd_plan.direct_vs_network.copy()
+        if compare_df.empty:
+            st.caption("No direct vs network comparisons available.")
+        else:
+            display_df = compare_df.copy()
+            def _recommend_cost(row):
+                if row.get("Recommendation") == "DIRECT":
+                    return row.get("Direct Cost", np.nan)
+                if row.get("Recommendation") == "NETWORK":
+                    net_cpr = row.get("Network eCPR", np.nan)
+                    shortfall = row.get("Shortfall", 0.0)
+                    return shortfall * net_cpr if np.isfinite(net_cpr) else np.nan
+                return np.nan
+
+            display_df["Recommended Cost"] = display_df.apply(_recommend_cost, axis=1)
+            for col in ["Direct CPL", "Direct Cost", "Network eCPR", "Network System CPR"]:
+                display_df[col] = display_df[col].map(lambda v: format_currency(v) if np.isfinite(v) else "-")
+            display_df["Recommended Cost"] = display_df["Recommended Cost"].map(lambda v: format_currency(v) if np.isfinite(v) else "-")
+            display_df["Transfer Rate"] = display_df["Transfer Rate"].map(lambda v: f"{v:.0%}")
+            display_df["Network Leakage"] = display_df["Network Leakage"].map(lambda v: f"{v:.0%}")
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+            scatter_df = compare_df.replace([np.inf, -np.inf], np.nan).dropna(subset=["Direct CPL", "Network eCPR"])
+            if scatter_df.empty:
+                st.caption("Not enough data to render comparison scatter.")
+            else:
+                fig = px.scatter(
+                    scatter_df,
+                    x="Direct CPL",
+                    y="Network eCPR",
+                    size="Shortfall",
+                    color="Urgency",
+                    color_continuous_scale="YlOrRd",
+                    hover_data=["Campaign", "Recommendation"],
+                )
+                max_val = max(scatter_df["Direct CPL"].max(), scatter_df["Network eCPR"].max())
+                fig.add_trace(go.Scatter(
+                    x=[0, max_val],
+                    y=[0, max_val],
+                    mode="lines",
+                    line=dict(color="#94a3b8", dash="dash"),
+                    showlegend=False,
+                ))
+                fig.add_annotation(x=max_val * 0.2, y=max_val * 0.8, text="Direct cheaper", showarrow=False)
+                fig.add_annotation(x=max_val * 0.8, y=max_val * 0.2, text="Network cheaper", showarrow=False)
+                fig.update_layout(height=360, margin=dict(l=10, r=10, t=30, b=10))
+                st.plotly_chart(fig, use_container_width=True)
+
+    with tab3:
+        alloc_df = _cmd_plan.allocations.copy()
+        if alloc_df.empty:
+            st.caption("No allocation plan generated.")
+        else:
+            display_alloc = alloc_df.rename(columns={
+                "target_campaign": "Target",
+                "strategy": "Strategy",
+                "source": "Source",
+                "spend": "Spend",
+                "expected_leads_gross": "Leads (Gross)",
+                "expected_leads_to_target": "Leads to Target",
+                "leakage_leads": "Leakage",
+                "effective_cpr": "Effective CPR",
+                "pace_impact": "Pace Impact",
+                "rationale": "Rationale",
+            })
+            display_alloc["Spend"] = display_alloc["Spend"].map(lambda v: format_currency(v))
+            display_alloc["Effective CPR"] = display_alloc["Effective CPR"].map(lambda v: format_currency(v) if np.isfinite(v) else "-")
+            display_alloc["Pace Impact"] = display_alloc["Pace Impact"].map(lambda v: f"{v:.2f}/d")
+            st.dataframe(display_alloc, use_container_width=True, hide_index=True)
+
+            spend_mix = alloc_df.groupby("strategy")["spend"].sum().reset_index()
+            fig = px.pie(
+                spend_mix,
+                names="strategy",
+                values="spend",
+                hole=0.4,
+                color="strategy",
+                color_discrete_map={"DIRECT": "#3B82F6", "NETWORK": "#8B5CF6"},
+            )
+            fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+    with tab4:
+        recon_df = _cmd_plan.reconciliation.copy()
+        if recon_df.empty:
+            st.caption("No reconciliation available.")
+        else:
+            display_recon = recon_df.rename(columns={
+                "campaign": "Campaign",
+                "lead_target": "Target",
+                "leads_actual": "Actual (Now)",
+                "leads_from_direct": "+ Direct Plan",
+                "leads_from_network": "+ Network Plan",
+                "leads_leaked": "Leakage",
+                "total_projected": "Projected Total",
+                "gap_remaining": "Gap",
+                "coverage_pct": "Coverage %",
+            })
+            display_recon["Coverage %"] = display_recon["Coverage %"].map(lambda v: f"{v:.0%}")
+            st.dataframe(display_recon, use_container_width=True, hide_index=True)
+
+            total_row = recon_df[recon_df["campaign"] == "TOTAL"]
+            if not total_row.empty:
+                total = total_row.iloc[0]
+                fig = go.Figure(go.Waterfall(
+                    name="TOTAL",
+                    orientation="v",
+                    measure=["absolute", "relative", "relative", "relative", "total", "relative"],
+                    x=["Actual", "Direct", "Network", "Leakage", "Projected", "Gap"],
+                    y=[
+                        total["leads_actual"],
+                        total["leads_from_direct"],
+                        total["leads_from_network"],
+                        -total["leads_leaked"],
+                        total["total_projected"],
+                        total["gap_remaining"],
+                    ],
+                    increasing=dict(marker=dict(color="#22C55E")),
+                    decreasing=dict(marker=dict(color="#EF4444")),
+                    totals=dict(marker=dict(color="#3B82F6")),
+                ))
+                fig.update_layout(height=360, margin=dict(l=10, r=10, t=30, b=10))
+                st.plotly_chart(fig, use_container_width=True)
+
+    xlsx_bytes = CampaignCommandEngine.export_to_excel(_cmd_plan)
+    st.download_button(
+        "Download Full Plan (Excel)",
+        data=xlsx_bytes,
+        file_name="campaign_command_plan.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+    )
+
 st.markdown('</div>', unsafe_allow_html=True)
 
 # Manifest download
