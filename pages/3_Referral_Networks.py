@@ -20,8 +20,8 @@ root = Path(__file__).parent.parent
 if str(root) not in sys.path:
     sys.path.insert(0, str(root))
 
-from src.data_loader import load_events, load_origin_perf, load_media_raw, export_to_excel
-from src.normalization import normalize_events, normalize_media_raw
+from src.data_loader import load_events, load_origin_perf, export_to_excel
+from src.normalization import normalize_events
 from src.referral_clusters import run_referral_clustering
 from src.builder_pnl import build_builder_pnl
 from src.network_optimization import calculate_shortfalls, analyze_network_leverage, build_prescriptive_plan, compute_lag_metrics_simple
@@ -625,17 +625,6 @@ def load_data(events_file):
     return normalize_events(events) if events is not None else None
 
 @st.cache_data(show_spinner=False)
-def load_media_data(media_file):
-    if media_file is None:
-        return None
-    try:
-        media_file.seek(0)
-    except Exception:
-        pass
-    media_raw = load_media_raw(media_file)
-    return normalize_media_raw(media_raw) if media_raw is not None else None
-
-@st.cache_data(show_spinner=False)
 def process_network(_events, start_date, end_date, excluded_builders):
     df = _events.copy()
     
@@ -877,9 +866,6 @@ def build_budget_flow_dot(allocations, target_analyses, total_budget, unallocate
 def main():
     events_file = st.session_state.get("events_file")
     events = load_data(events_file)
-    media_file = st.session_state.get("media_file")
-    media_raw = load_media_data(media_file)
-    
     if events is None:
         st.warning("⚠️ Please upload Events data on the Home page.")
         st.page_link("app.py", label="← Go to Home", icon="🏠")
@@ -917,92 +903,36 @@ def main():
             events.columns,
             ["ad_key", "utm_key", "utm_campaign", "Campaign", "campaign"]
         )
-        payer_col = _find_col(
+        dest_builder_col = _find_col(
             events.columns,
-            ["MediaPayer_BuilderRegionKey", "MediaPayerBuilderRegionKey", "MediaPayer"]
+            ["Dest_BuilderRegionKey", "Dest_BuildRegionKey", "DestBuilderRegionKey", "Dest_builder", "Dest"]
         )
-        paused_campaigns = set()
-        paused_campaigns_ready = False
-        paused_campaigns_error = None
-        paused_payer_builders = []
-        media_ad_col = None
-        media_status_col = None
-        if media_raw is not None and not media_raw.empty:
-            media_ad_col = _find_col(
-                media_raw.columns,
-                ["ad_key", "Ad: Ad name", "ad_name", "utm_key", "utm_campaign", "Campaign", "campaign", "campaign_name", "Campaign name"]
-            )
-            media_status_col = _find_col(
-                media_raw.columns,
-                ["effective_status", "Effective_Status", "status", "Status"]
-            )
-            if media_ad_col and media_status_col:
-                statuses = media_raw[media_status_col].fillna("").astype(str).str.strip().str.upper()
-                paused_mask = statuses.isin({"PAUSED", "CAMPAIGN_PAUSED"})
-                paused_campaigns = set(
-                    media_raw.loc[paused_mask, media_ad_col]
-                    .dropna()
-                    .astype(str)
-                    .str.strip()
-                    .tolist()
-                )
-                paused_campaigns_ready = True
-                if paused_campaigns and event_campaign_col and payer_col:
-                    paused_payer_builders = (
-                        events.loc[
-                            events[event_campaign_col].astype(str).str.strip().isin(paused_campaigns),
-                            payer_col
-                        ]
-                        .dropna()
-                        .astype(str)
-                        .str.strip()
-                        .unique()
-                        .tolist()
-                    )
-            else:
-                paused_campaigns_error = "Media file missing effective_status or ad key."
-        else:
-            paused_campaigns_error = "No media file uploaded."
-
-        exclude_paused_campaigns = st.checkbox(
-            "Exclude PAUSED campaigns (media effective_status)",
-            key="exclude_paused_campaigns",
-            value=False,
-            help="Filters out campaigns with effective_status = PAUSED or CAMPAIGN_PAUSED from media_raw_base_phase0."
+        status_col = _find_col(
+            events.columns,
+            ["STATUS_final", "Status_final", "status_final"]
         )
-        if exclude_paused_campaigns:
-            if paused_campaigns_error:
-                st.warning(f"Paused-campaign filter enabled but {paused_campaigns_error.lower()}")
-            elif not event_campaign_col:
-                st.warning("Paused-campaign filter enabled but events missing campaign key (ad_key/utm_key/utm_campaign).")
-            elif not paused_campaigns_ready:
-                st.warning("Paused-campaign filter enabled but paused status could not be derived.")
-            else:
-                if paused_campaigns:
-                    before = len(events_filtered)
-                    events_filtered = events_filtered[
-                        ~events_filtered[event_campaign_col]
-                        .astype(str)
-                        .str.strip()
-                        .isin(paused_campaigns)
-                    ]
-                    st.caption(
-                        f"Excluded {before - len(events_filtered):,} events from {len(paused_campaigns):,} paused campaigns."
-                    )
-                else:
-                    st.caption("No paused campaigns found in media file.")
-        
+        default_excluded = []
+        if dest_builder_col and status_col:
+            statuses = events[status_col].fillna("").astype(str).str.strip()
+            not_live = statuses.str.upper() != "LIVE"
+            default_excluded = (
+                events.loc[not_live, dest_builder_col]
+                .dropna()
+                .astype(str)
+                .str.strip()
+                .unique()
+                .tolist()
+            )
         builder_options = sorted(set(
             events_filtered["MediaPayer_BuilderRegionKey"].dropna().unique().tolist() +
             events_filtered["Dest_BuilderRegionKey"].dropna().unique().tolist()
         ))
 
-        default_excluded = sorted(set(paused_payer_builders))
         if "excluded_builders_initialized" not in st.session_state:
-            st.session_state["excluded_builders"] = [b for b in default_excluded if b in builder_options]
+            st.session_state["excluded_builders"] = [
+                b for b in sorted(set(default_excluded)) if b in builder_options
+            ]
             st.session_state["excluded_builders_initialized"] = True
-        if "excluded_builders_autosync" not in st.session_state:
-            st.session_state["excluded_builders_autosync"] = True
 
         def _clear_excluded():
             st.session_state["excluded_builders"] = []
@@ -1010,22 +940,6 @@ def main():
                 st.session_state.targets = []
             st.session_state.focus_builder = None
             st.session_state.optimization_result = None
-
-        def _sync_excluded():
-            st.session_state["excluded_builders"] = [b for b in default_excluded if b in builder_options]
-            if st.session_state.targets:
-                st.session_state.targets = [t for t in st.session_state.targets if t not in st.session_state["excluded_builders"]]
-            if st.session_state.focus_builder in set(st.session_state["excluded_builders"]):
-                st.session_state.focus_builder = None
-            st.session_state.optimization_result = None
-
-        st.checkbox(
-            "Auto-sync exclusions from paused campaigns",
-            key="excluded_builders_autosync",
-            help="When enabled, exclusions follow media effective_status = PAUSED/CAMPAIGN_PAUSED (payer builders)."
-        )
-        if st.session_state["excluded_builders_autosync"]:
-            _sync_excluded()
         excluded = st.multiselect(
             "Exclude builders from clustering",
             builder_options,
@@ -1033,8 +947,6 @@ def main():
             key="excluded_builders",
             help="Removes selected builders from the network graph and clustering."
         )
-        if not st.session_state["excluded_builders_autosync"]:
-            st.button("Reset exclusions to paused defaults", on_click=_sync_excluded)
         if excluded:
             chips = "".join(f"<span class='chip'>{html.escape(b)}</span>" for b in excluded)
             st.markdown(f"<div class='chip-row'>{chips}</div>", unsafe_allow_html=True)
@@ -1869,52 +1781,6 @@ def main():
             st.graphviz_chart(flow_dot, use_container_width=True)
         else:
             st.caption("Not enough data to render the flow diagram.")
-
-    # ========================================================================
-    # SECTION 4: ECONOMIC PATH RECOMMENDATIONS
-    # ========================================================================
-    if not sf.empty and not data['leverage'].empty:
-        st.markdown("""
-        <div class="section">
-            <div class="section-header">
-                <span class="section-num">4</span>
-                <span class="section-title">Economic Path Recommendations</span>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        leverage = data['leverage'].copy()
-        leverage = leverage.replace([np.inf, -np.inf], np.nan).dropna(subset=['eCPR'])
-
-        risk_targets = sf.sort_values("Risk_Score", ascending=False)["BuilderRegionKey"].dropna().unique().tolist()
-        if not risk_targets:
-            st.caption("No at-risk targets available for recommendations.")
-        else:
-            target = st.selectbox("Target builder (shortfall)", risk_targets, index=0)
-            target_rows = leverage[leverage['Dest_BuilderRegionKey'] == target].copy()
-            target_rows = target_rows.sort_values(['eCPR', 'Transfer_Rate'], ascending=[True, False]).head(10)
-
-            if target_rows.empty:
-                st.caption("No economic paths available for this target.")
-            else:
-                target_rows['Recommendation'] = target_rows.apply(
-                    lambda r: f"Shift budget to {r['MediaPayer_BuilderRegionKey']} (TR {r['Transfer_Rate']:.0%}, eCPR ${r['eCPR']:,.0f})",
-                    axis=1
-                )
-                st.dataframe(
-                    target_rows[[
-                        'MediaPayer_BuilderRegionKey',
-                        'Transfer_Rate',
-                        'eCPR',
-                        'Recommendation'
-                    ]].rename(columns={
-                        'MediaPayer_BuilderRegionKey': 'Payer',
-                        'Transfer_Rate': 'Transfer Rate',
-                        'eCPR': 'eCPR'
-                    }),
-                    hide_index=True
-                )
-
 
 if __name__ == "__main__":
     main()
