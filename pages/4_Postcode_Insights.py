@@ -64,11 +64,18 @@ def load_data(events_file):
 
 def _find_col(columns, candidates):
     cols = {c.lower(): c for c in columns}
+    cols_stripped = {c.strip().lower(): c for c in columns}
+    cols_norm = {re.sub(r"[^a-z0-9]+", "", c.strip().lower()): c for c in columns}
     for c in candidates:
         if c in columns:
             return c
         if c.lower() in cols:
             return cols[c.lower()]
+        if c.strip().lower() in cols_stripped:
+            return cols_stripped[c.strip().lower()]
+        norm_key = re.sub(r"[^a-z0-9]+", "", c.strip().lower())
+        if norm_key in cols_norm:
+            return cols_norm[norm_key]
     return None
 
 
@@ -84,6 +91,18 @@ def _normalize_bool(series: pd.Series) -> pd.Series:
         return numeric.fillna(0).astype(float) > 0
     s = series.fillna("").astype(str).str.strip().str.lower()
     return s.isin(["true", "1", "yes", "y", "t"])
+
+
+def _normalize_id(series: pd.Series) -> pd.Series:
+    if series is None:
+        return pd.Series([np.nan] * 0)
+    s = (
+        series.astype(str)
+        .str.strip()
+        .str.replace(r"\.0+$", "", regex=True)
+        .replace({"": np.nan, "nan": np.nan, "NaN": np.nan, "None": np.nan, "none": np.nan})
+    )
+    return s
 
 
 @st.cache_data(show_spinner=False)
@@ -258,6 +277,21 @@ def main():
 
     campaign_col = _find_col(df.columns, ["utm_campaign", "utm_key", "ad_key"])
     spend_col = _find_col(df.columns, ["MediaCost_referral_event", "MediaCost_builder_touch", "MediaCost_origin_lead"])
+    original_deal_col = _find_col(
+        df.columns,
+        [
+            "Original Deal ID", "Original DealId", "Original DealID",
+            "Original_Deal_ID", "Original_DealId", "Original_DealID",
+            "OriginalDealID", "OriginalDealId", "OriginalDeal ID"
+        ]
+    )
+    deal_id_col = _find_col(
+        df.columns,
+        [
+            "Deals: Id", "Deals:Id", "Deals Id", "Deal Id", "DealID",
+            "Deals_Id", "Deal_ID", "DealsID", "Deal: Id"
+        ]
+    )
 
     # KPI header
     st.markdown("""
@@ -279,13 +313,25 @@ def main():
 
     lead_id_col = "LeadId" if "LeadId" in df.columns else None
     ref_flag_col = "is_referral_bool"
+    if original_deal_col:
+        df["_original_deal_id"] = _normalize_id(df[original_deal_col])
+    if deal_id_col:
+        df["_deal_id"] = _normalize_id(df[deal_id_col])
     if "is_referral" in df.columns:
         df[ref_flag_col] = _normalize_bool(df["is_referral"])
     else:
         df[ref_flag_col] = False
 
+    lead_flag_col = "is_original_lead_bool"
+    if "MediaPayer_BuilderRegionKey" in df.columns and "Dest_BuilderRegionKey" in df.columns:
+        df[lead_flag_col] = (~df[ref_flag_col]) & (
+            df["MediaPayer_BuilderRegionKey"] == df["Dest_BuilderRegionKey"]
+        )
+    else:
+        df[lead_flag_col] = ~df[ref_flag_col]
+
     if ref_flag_col in df.columns:
-        lead_df = df[df[ref_flag_col] == False].copy()
+        lead_df = df[df[lead_flag_col]].copy()
         refs_df = df[df[ref_flag_col]].copy()
         group = lead_df.groupby([postcode_col, suburb_col], as_index=False).agg(
             Leads=("event_date", "size"),
@@ -1448,9 +1494,9 @@ def main():
                 state_benchmark = (
                     df.groupby("State", as_index=False)
                     .agg(
-                        Leads=("is_referral_bool", lambda x: (~x).sum()),
-                        Referrals=("is_referral_bool", "sum"),
-                        Events=("is_referral_bool", "size"),
+                        Leads=(lead_flag_col, "sum"),
+                        Referrals=(ref_flag_col, "sum"),
+                        Events=("event_date", "size"),
                         Avg_CPR=("_event_spend", lambda s: s.sum() / max(1, len(s)))
                     )
                 )
@@ -1891,27 +1937,74 @@ def main():
                     return empty
                 return fmt.format(val)
 
+            id_count_label = "Use Original Deal ID + Deals: Id (recommended)" if (original_deal_col and deal_id_col) else "Count unique LeadId (recommended)"
+            use_unique_ids = st.checkbox(
+                id_count_label,
+                value=True,
+                key="campaign_unique_counts"
+            )
+
+            def _id_sets(df_in):
+                if (
+                    use_unique_ids and original_deal_col and deal_id_col and
+                    "_original_deal_id" in df_in.columns and "_deal_id" in df_in.columns
+                ):
+                    orig_set = set(df_in["_original_deal_id"].dropna())
+                    deal_set = set(df_in["_deal_id"].dropna())
+                    return orig_set, deal_set
+                return None, None
+
+            def _count_leads_refs(df_in):
+                orig_set, deal_set = _id_sets(df_in)
+                if orig_set is not None and deal_set is not None:
+                    leads = len(orig_set)
+                    referrals = len(deal_set - orig_set)
+                    events = leads + referrals
+                    return leads, referrals, events, orig_set
+                lead_mask = df_in[lead_flag_col] if lead_flag_col in df_in.columns else (~df_in[ref_flag_col])
+                ref_mask = df_in[ref_flag_col] if ref_flag_col in df_in.columns else pd.Series(False, index=df_in.index)
+                leads = int(lead_mask.sum())
+                refs = int(ref_mask.sum())
+                events = leads + refs
+                return leads, refs, events, None
+
+            def _lead_ref_masks(df_in, orig_set=None):
+                if orig_set is not None and "_deal_id" in df_in.columns:
+                    deal_series = df_in["_deal_id"]
+                    lead_mask = deal_series.isin(orig_set)
+                    ref_mask = deal_series.notna() & (~deal_series.isin(orig_set))
+                    return lead_mask, ref_mask
+                lead_mask = df_in[lead_flag_col] if lead_flag_col in df_in.columns else (~df_in[ref_flag_col])
+                ref_mask = df_in[ref_flag_col] if ref_flag_col in df_in.columns else pd.Series(False, index=df_in.index)
+                return lead_mask, ref_mask
+
             st.markdown("**Performance trends**")
             trend_freq = st.radio("Trend period", ["Weekly", "Monthly"], horizontal=True, key="campaign_trend_freq")
             trend_period = "W" if trend_freq == "Weekly" else "M"
+            def _period_summary(g):
+                leads, refs, events, _ = _count_leads_refs(g)
+                return pd.Series({
+                    "Spend": g["_event_spend"].sum(),
+                    "Leads": leads,
+                    "Referrals": refs,
+                    "Events": events,
+                    "Revenue": g["_event_revenue"].sum(min_count=1)
+                })
+
             ts_campaign = (
                 df.assign(period=df["event_date"].dt.to_period(trend_period).dt.start_time)
-                .groupby("period", as_index=False)
-                .agg(
-                    Spend=("_event_spend", "sum"),
-                    Leads=("is_referral_bool", lambda x: (~x).sum()),
-                    Referrals=("is_referral_bool", "sum"),
-                    Revenue=("_event_revenue", lambda s: s.sum(min_count=1))
-                )
+                .groupby("period")
+                .apply(_period_summary)
+                .reset_index()
             )
             ts_campaign["CPR"] = np.where(
-                (ts_campaign["Leads"] + ts_campaign["Referrals"]) > 0,
-                ts_campaign["Spend"] / (ts_campaign["Leads"] + ts_campaign["Referrals"]),
+                ts_campaign["Events"] > 0,
+                ts_campaign["Spend"] / ts_campaign["Events"],
                 np.nan
             )
             ts_campaign["Revenue_per_Event"] = np.where(
-                (ts_campaign["Leads"] + ts_campaign["Referrals"]) > 0,
-                ts_campaign["Revenue"] / (ts_campaign["Leads"] + ts_campaign["Referrals"]),
+                ts_campaign["Events"] > 0,
+                ts_campaign["Revenue"] / ts_campaign["Events"],
                 np.nan
             )
 
@@ -1998,7 +2091,14 @@ def main():
             )
             expected_days = st.slider("Expected days to first lead", 1, 30, 10, step=1)
             df["_has_spend"] = df["_event_spend"] > 0
-            df["_is_lead_event"] = df["is_referral_bool"] == False
+            if use_unique_ids and original_deal_col and deal_id_col and "_original_deal_id" in df.columns and "_deal_id" in df.columns:
+                df["_is_lead_event"] = (
+                    df["_original_deal_id"].notna() &
+                    df["_deal_id"].notna() &
+                    (df["_original_deal_id"] == df["_deal_id"])
+                )
+            else:
+                df["_is_lead_event"] = df[lead_flag_col]
             campaign_first = (
                 df.groupby(campaign_col, as_index=False)
                 .agg(
@@ -2031,23 +2131,29 @@ def main():
             st.plotly_chart(lag_fig, use_container_width=True, config={"displayModeBar": False})
 
             st.markdown("**Campaign performance (current window)**")
+            def _campaign_summary(g):
+                leads, refs, events, _ = _count_leads_refs(g)
+                return pd.Series({
+                    "Spend": g["_event_spend"].sum(),
+                    "Leads": leads,
+                    "Referrals": refs,
+                    "Events": events,
+                    "Revenue": g["_event_revenue"].sum(min_count=1)
+                })
+
             camp_perf = (
-                df.groupby(campaign_col, as_index=False)
-                .agg(
-                    Spend=("_event_spend", "sum"),
-                    Leads=("is_referral_bool", lambda x: (~x).sum()),
-                    Referrals=("is_referral_bool", "sum"),
-                    Revenue=("_event_revenue", lambda s: s.sum(min_count=1))
-                )
+                df.groupby(campaign_col)
+                .apply(_campaign_summary)
+                .reset_index()
             )
             camp_perf["CPR"] = np.where(
-                (camp_perf["Leads"] + camp_perf["Referrals"]) > 0,
-                camp_perf["Spend"] / (camp_perf["Leads"] + camp_perf["Referrals"]),
+                camp_perf["Events"] > 0,
+                camp_perf["Spend"] / camp_perf["Events"],
                 np.nan
             )
             camp_perf["Revenue / Event"] = np.where(
-                (camp_perf["Leads"] + camp_perf["Referrals"]) > 0,
-                camp_perf["Revenue"] / (camp_perf["Leads"] + camp_perf["Referrals"]),
+                camp_perf["Events"] > 0,
+                camp_perf["Revenue"] / camp_perf["Events"],
                 np.nan
             )
             camp_perf["ROAS"] = np.where(camp_perf["Spend"] > 0, camp_perf["Revenue"] / camp_perf["Spend"], np.nan)
@@ -2057,16 +2163,11 @@ def main():
                 hide_index=True
             )
 
-            st.markdown("**Single campaign view**")
+            st.markdown("**Single campaign view (ad set breakdown)**")
             campaign_pick = st.selectbox(
                 "Select campaign",
                 sorted(df[campaign_col].dropna().unique().tolist()),
                 key="campaign_tracker_pick"
-            )
-            use_unique_ids = st.checkbox(
-                "Count unique LeadId (recommended)",
-                value=True,
-                key="campaign_unique_counts"
             )
             auto_lead_col = _find_col(df.columns, ["LeadId", "lead_id", "LeadID"])
             auto_parent_col = _find_col(
@@ -2074,8 +2175,17 @@ def main():
                 ["ParentLeadId", "Parent_LeadId", "ParentLeadID", "ReferrerLeadId", "Referrer_LeadId",
                  "RefLeadId", "ParentLead", "ReferrerLead"]
             )
+            auto_adset_col = _find_col(
+                df.columns,
+                [
+                    "ad_set", "adset", "ad_set_name", "adset_name",
+                    "ad_group", "adgroup", "ad_group_name", "adgroup_name",
+                    "ad_set_id", "adset_id", "ad_group_id", "adgroup_id",
+                    "utm_content", "ad_name", "creative", "creative_name"
+                ]
+            )
             cols_list = sorted(df.columns.tolist())
-            with st.expander("Reconciliation column mapping", expanded=False):
+            with st.expander("Column mapping (optional)", expanded=False):
                 lead_choice = st.selectbox(
                     "Lead ID column",
                     ["(auto)"] + cols_list,
@@ -2088,36 +2198,93 @@ def main():
                     index=(["(auto)"] + cols_list).index(auto_parent_col) if auto_parent_col in cols_list else 0,
                     key="campaign_parent_col_choice"
                 )
+                adset_choice = st.selectbox(
+                    "Ad set column",
+                    ["(auto)"] + cols_list,
+                    index=(["(auto)"] + cols_list).index(auto_adset_col) if auto_adset_col in cols_list else 0,
+                    key="campaign_adset_col_choice"
+                )
             lead_id_col = auto_lead_col if lead_choice == "(auto)" else lead_choice
             parent_id_col = auto_parent_col if parent_choice == "(auto)" else parent_choice
+            adset_col = auto_adset_col if adset_choice == "(auto)" else adset_choice
             c_df = df[df[campaign_col] == campaign_pick].copy()
             if c_df.empty:
                 st.caption("No activity for this campaign.")
             else:
-                lead_events = c_df[c_df["is_referral_bool"] == False]
-                ref_events = c_df[c_df["is_referral_bool"] == True]
+                if use_unique_ids and original_deal_col and deal_id_col:
+                    st.caption("Counts use Original Deal ID for leads; referrals = unique Deals: Id minus unique Original Deal ID.")
+
+                def _summarize_group(df_in):
+                    leads, refs, events, orig_set = _count_leads_refs(df_in)
+                    lead_mask, ref_mask = _lead_ref_masks(df_in, orig_set)
+                    spend = float(df_in["_event_spend"].sum())
+                    lead_spend_local = float(df_in.loc[lead_mask, "_event_spend"].sum())
+                    ref_spend_local = float(df_in.loc[ref_mask, "_event_spend"].sum())
+                    revenue = float(df_in["_event_revenue"].sum(min_count=1))
+                    return pd.Series({
+                        "Spend": spend,
+                        "Leads": leads,
+                        "Referrals": refs,
+                        "Events": events,
+                        "CPR": _safe_div(spend, events),
+                        "CPL": _safe_div(spend, leads),
+                        "CPR_referral": _safe_div(ref_spend_local, refs),
+                        "Referral Rate": _safe_div(refs, leads),
+                        "Revenue / Event": _safe_div(revenue, events),
+                        "ROAS": _safe_div(revenue, spend)
+                    })
+
+                adset_pick = None
+                detail_label = campaign_pick
+                scope_label = "campaign"
+                adset_values = []
+                if adset_col and adset_col in c_df.columns:
+                    adset_values = sorted(c_df[adset_col].dropna().unique().tolist())
+                if adset_values:
+                    st.markdown("**Ad set performance (current window)**")
+                    adset_perf = (
+                        c_df.groupby(adset_col, dropna=True)
+                        .apply(_summarize_group)
+                        .reset_index()
+                    )
+                    adset_perf = adset_perf.rename(columns={adset_col: "Ad Set", "CPR_referral": "CPR (referral)"})
+                    adset_perf = adset_perf.sort_values(["CPR", "Events"], ascending=[True, False])
+                    st.dataframe(adset_perf, hide_index=True, use_container_width=True)
+                    adset_pick = st.selectbox(
+                        "Select ad set for detailed view",
+                        ["(All ad sets)"] + adset_values,
+                        key="campaign_adset_pick"
+                    )
+                    if adset_pick != "(All ad sets)":
+                        c_df = c_df[c_df[adset_col] == adset_pick].copy()
+                        detail_label = f"{campaign_pick} / {adset_pick}"
+                        scope_label = "ad set"
+                    else:
+                        adset_pick = None
+                if adset_values:
+                    st.caption(f"Detail scope: {detail_label}")
+
+                leads_count, refs_count, events_total, orig_set = _count_leads_refs(c_df)
+                lead_mask, ref_mask = _lead_ref_masks(c_df, orig_set)
+                lead_events = c_df[lead_mask]
+                ref_events = c_df[ref_mask]
                 lead_spend = float(lead_events["_event_spend"].sum())
                 ref_spend = float(ref_events["_event_spend"].sum())
                 def _count_rows(df_in, flag_val=None):
-                    if use_unique_ids and lead_id_col and lead_id_col in df_in.columns:
-                        if flag_val is None:
-                            return int(df_in[lead_id_col].nunique())
-                        mask = df_in["is_referral_bool"] == flag_val
-                        return int(df_in.loc[mask, lead_id_col].nunique())
+                    leads, refs, events, _ = _count_leads_refs(df_in)
                     if flag_val is None:
-                        return int(len(df_in))
-                    return int((df_in["is_referral_bool"] == flag_val).sum())
+                        return events
+                    return leads if flag_val is False else refs
                 camp_kpis = {
                     "Spend": float(c_df["_event_spend"].sum()),
-                    "Leads": _count_rows(c_df, False),
-                    "Referrals": _count_rows(c_df, True),
+                    "Leads": leads_count,
+                    "Referrals": refs_count,
                     "Revenue": float(c_df["_event_revenue"].sum(min_count=1))
                 }
-                events_total = camp_kpis["Leads"] + camp_kpis["Referrals"]
-                unique_events = int(c_df[lead_id_col].nunique()) if use_unique_ids and lead_id_col else int(len(c_df))
+                unique_events = events_total
                 camp_kpis["Events"] = events_total
                 camp_kpis["CPR"] = _safe_div(camp_kpis["Spend"], events_total)
-                camp_kpis["CPL"] = _safe_div(lead_spend, camp_kpis["Leads"])
+                camp_kpis["CPL"] = _safe_div(camp_kpis["Spend"], camp_kpis["Leads"])
                 camp_kpis["CPR_referral"] = _safe_div(ref_spend, camp_kpis["Referrals"])
                 camp_kpis["Referral Rate"] = _safe_div(camp_kpis["Referrals"], camp_kpis["Leads"])
                 camp_kpis["Revenue / Event"] = _safe_div(camp_kpis["Revenue"], events_total)
@@ -2151,18 +2318,96 @@ def main():
                     ]
                 })
                 st.dataframe(trace_df, hide_index=True, use_container_width=True)
+
+                st.markdown("**Destination mix over time (leads vs referrals)**")
+                dest_col = "Dest_BuilderRegionKey"
+                if dest_col not in c_df.columns:
+                    st.caption("Destination mix requires Dest_BuilderRegionKey.")
+                else:
+                    mix_base = c_df.dropna(subset=[dest_col]).copy()
+                    if mix_base.empty:
+                        st.caption("No destination data available for this selection.")
+                    else:
+                        dest_totals = (
+                            mix_base.groupby(dest_col)
+                            .apply(lambda g: pd.Series(_count_leads_refs(g)[:3], index=["Leads", "Referrals", "Events"]))
+                            .reset_index()
+                        )
+                        top_n = 8
+                        top_dests = (
+                            dest_totals.sort_values("Events", ascending=False)
+                            .head(top_n)[dest_col]
+                            .tolist()
+                        )
+                        mix_base["_dest_bucket"] = np.where(
+                            mix_base[dest_col].isin(top_dests),
+                            mix_base[dest_col],
+                            "Other"
+                        )
+                        mix = (
+                            mix_base.assign(period=mix_base["event_date"].dt.to_period(trend_period).dt.start_time)
+                            .groupby(["period", "_dest_bucket"])
+                            .apply(lambda g: pd.Series(_count_leads_refs(g)[:2], index=["Leads", "Referrals"]))
+                            .reset_index()
+                            .rename(columns={"_dest_bucket": "Destination"})
+                        )
+                        mix_long = mix.melt(
+                            id_vars=["period", "Destination"],
+                            value_vars=["Leads", "Referrals"],
+                            var_name="Metric",
+                            value_name="Value"
+                        )
+                        mix_long = mix_long[mix_long["Value"] > 0]
+                        if mix_long.empty:
+                            st.caption("No lead/referral volume to display for this selection.")
+                        else:
+                            mix_fig = px.bar(
+                                mix_long,
+                                x="period",
+                                y="Value",
+                                color="Destination",
+                                barmode="stack",
+                                facet_row="Metric"
+                            )
+                            mix_fig.update_layout(
+                                height=420,
+                                margin=dict(l=0, r=0, t=40, b=0),
+                                legend_title="Destination",
+                                xaxis_title="Period",
+                                yaxis_title="Count"
+                            )
+                            mix_fig.for_each_annotation(lambda a: a.update(text=a.text.replace("Metric=", "")))
+                            st.plotly_chart(mix_fig, use_container_width=True, config={"displayModeBar": False})
                 if lead_id_col and parent_id_col:
-                    parent_source = df[[lead_id_col, campaign_col, "is_referral_bool"]].dropna(subset=[lead_id_col])
-                    lead_parent_source = parent_source[parent_source["is_referral_bool"] == False]
+                    parent_cols = [lead_id_col, campaign_col, lead_flag_col]
+                    if adset_col and adset_col in df.columns:
+                        parent_cols.append(adset_col)
+                    parent_source = df[parent_cols].dropna(subset=[lead_id_col])
+                    lead_parent_source = parent_source[parent_source[lead_flag_col]]
                     if lead_parent_source.empty:
                         lead_parent_source = parent_source
                     parent_campaign_map = (
                         lead_parent_source.drop_duplicates(lead_id_col)
                         .set_index(lead_id_col)[campaign_col]
                     )
-                    referrals_all = df[df["is_referral_bool"] == True].copy()
+                    parent_adset_map = None
+                    if adset_col and adset_col in lead_parent_source.columns:
+                        parent_adset_map = (
+                            lead_parent_source.drop_duplicates(lead_id_col)
+                            .set_index(lead_id_col)[adset_col]
+                        )
+                    referrals_all = df[df[ref_flag_col] == True].copy()
                     referrals_all["_parent_campaign"] = referrals_all[parent_id_col].map(parent_campaign_map)
-                    referrals_from_campaign = referrals_all[referrals_all["_parent_campaign"] == campaign_pick].copy()
+                    if adset_pick and parent_adset_map is not None:
+                        referrals_all["_parent_adset"] = referrals_all[parent_id_col].map(parent_adset_map)
+                        referrals_from_campaign = referrals_all[
+                            (referrals_all["_parent_campaign"] == campaign_pick) &
+                            (referrals_all["_parent_adset"] == adset_pick)
+                        ].copy()
+                    else:
+                        referrals_from_campaign = referrals_all[
+                            referrals_all["_parent_campaign"] == campaign_pick
+                        ].copy()
                     referrals_from_campaign_count = (
                         int(referrals_from_campaign[lead_id_col].nunique())
                         if use_unique_ids and lead_id_col in referrals_from_campaign.columns
@@ -2178,9 +2423,9 @@ def main():
                     delta_referrals = referrals_tagged_campaign - referrals_from_campaign_count
                     recon_df = pd.DataFrame({
                         "Metric": [
-                            "Leads tagged with campaign",
-                            "Referrals tagged with campaign",
-                            "Referrals generated from campaign leads (parent link)",
+                            f"Leads tagged with {scope_label}",
+                            f"Referrals tagged with {scope_label}",
+                            f"Referrals generated from {scope_label} leads (parent link)",
                             "Tagged vs parent-linked delta",
                             "Parent link coverage (all referrals)",
                             "Lead → Referral conversion (parent-linked)"
@@ -2224,39 +2469,34 @@ def main():
                     st.caption("Lead → referral reconciliation requires LeadId and ParentLeadId/ReferrerLeadId columns.")
 
                 tmp = c_df.assign(period=c_df["event_date"].dt.to_period(trend_period).dt.start_time)
-                if use_unique_ids and lead_id_col and lead_id_col in tmp.columns:
-                    c_ts = (
-                        tmp.groupby("period", as_index=False)
-                        .apply(lambda g: pd.Series({
-                            "Spend": g["_event_spend"].sum(),
-                            "Leads": g.loc[g["is_referral_bool"] == False, lead_id_col].nunique(),
-                            "Referrals": g.loc[g["is_referral_bool"] == True, lead_id_col].nunique(),
-                            "Revenue": g["_event_revenue"].sum(min_count=1)
-                        }))
-                    )
-                else:
-                    c_ts = (
-                        tmp.groupby("period", as_index=False)
-                        .agg(
-                            Spend=("_event_spend", "sum"),
-                            Leads=("is_referral_bool", lambda x: (~x).sum()),
-                            Referrals=("is_referral_bool", "sum"),
-                            Revenue=("_event_revenue", lambda s: s.sum(min_count=1))
-                        )
-                    )
+                def _detail_summary(g):
+                    leads, refs, events, _ = _count_leads_refs(g)
+                    return pd.Series({
+                        "Spend": g["_event_spend"].sum(),
+                        "Leads": leads,
+                        "Referrals": refs,
+                        "Events": events,
+                        "Revenue": g["_event_revenue"].sum(min_count=1)
+                    })
+                c_ts = (
+                    tmp.groupby("period")
+                    .apply(_detail_summary)
+                    .reset_index()
+                )
                 c_ts["CPR"] = np.where(
-                    (c_ts["Leads"] + c_ts["Referrals"]) > 0,
-                    c_ts["Spend"] / (c_ts["Leads"] + c_ts["Referrals"]),
+                    c_ts["Events"] > 0,
+                    c_ts["Spend"] / c_ts["Events"],
                     np.nan
                 )
                 c_ts["Revenue_per_Event"] = np.where(
-                    (c_ts["Leads"] + c_ts["Referrals"]) > 0,
-                    c_ts["Revenue"] / (c_ts["Leads"] + c_ts["Referrals"]),
+                    c_ts["Events"] > 0,
+                    c_ts["Revenue"] / c_ts["Events"],
                     np.nan
                 )
                 c_spend = go.Figure()
                 c_spend.add_trace(go.Scatter(x=c_ts["period"], y=c_ts["Spend"], name="Spend", mode="lines+markers", line=dict(color="#6366f1")))
-                c_spend.update_layout(height=200, margin=dict(l=0, r=0, t=30, b=0), yaxis_title="Spend", title="Campaign spend trend")
+                spend_title = "Ad set spend trend" if scope_label == "ad set" else "Campaign spend trend"
+                c_spend.update_layout(height=200, margin=dict(l=0, r=0, t=30, b=0), yaxis_title="Spend", title=spend_title)
                 st.plotly_chart(c_spend, use_container_width=True, config={"displayModeBar": False})
 
                 c_eff = go.Figure()
@@ -2295,7 +2535,8 @@ def main():
                         mode="lines+markers",
                         line=dict(color="#f59e0b", dash="dot")
                     ))
-                c_eff.update_layout(height=200, margin=dict(l=0, r=0, t=30, b=0), yaxis_title="Value", title="Campaign efficiency trend")
+                eff_title = "Ad set efficiency trend" if scope_label == "ad set" else "Campaign efficiency trend"
+                c_eff.update_layout(height=200, margin=dict(l=0, r=0, t=30, b=0), yaxis_title="Value", title=eff_title)
                 st.plotly_chart(c_eff, use_container_width=True, config={"displayModeBar": False})
 
             st.markdown("**Campaigns at risk (slow to first lead)**")
@@ -2408,9 +2649,9 @@ def main():
                     builder_breakdown = (
                         sel_df.groupby("Dest_BuilderRegionKey", as_index=False)
                         .agg(
-                            Leads=(ref_flag_col, lambda x: (~x).sum()),
+                            Leads=(lead_flag_col, "sum"),
                             Referrals=(ref_flag_col, "sum"),
-                            Events=(ref_flag_col, "size")
+                            Events=("event_date", "size")
                         )
                     )
                     builder_breakdown["Referral Rate"] = np.where(
@@ -2428,7 +2669,7 @@ def main():
                     ts = (
                         sel_df.groupby(pd.Grouper(key="event_date", freq="M"))
                         .agg(
-                            Leads=(ref_flag_col, lambda x: (~x).sum()),
+                            Leads=(lead_flag_col, "sum"),
                             Referrals=(ref_flag_col, "sum")
                         )
                         .reset_index()
@@ -2448,9 +2689,9 @@ def main():
                     source_breakdown = (
                         sel_df.groupby("MediaPayer_BuilderRegionKey", as_index=False)
                         .agg(
-                            Leads=(ref_flag_col, lambda x: (~x).sum()),
+                            Leads=(lead_flag_col, "sum"),
                             Referrals=(ref_flag_col, "sum"),
-                            Events=(ref_flag_col, "size")
+                            Events=("event_date", "size")
                         )
                         .sort_values("Events", ascending=False)
                     )
@@ -2499,9 +2740,9 @@ def main():
                     builder_pc = (
                         builder_df.groupby(postcode_col, as_index=False)
                         .agg(
-                            Leads_builder=(ref_flag_col, lambda x: (~x).sum()),
+                            Leads_builder=(lead_flag_col, "sum"),
                             Referrals_builder=(ref_flag_col, "sum"),
-                            Events_builder=(ref_flag_col, "size")
+                            Events_builder=("event_date", "size")
                         )
                     )
                     builder_pc["Referral_Rate_builder"] = np.where(
@@ -2606,10 +2847,10 @@ def main():
                             camp_summary = (
                                 camp_df.groupby(campaign_col, as_index=False)
                                 .agg(
-                                    Leads=(ref_flag_col, lambda x: (~x).sum()),
+                                    Leads=(lead_flag_col, "sum"),
                                     Referrals=(ref_flag_col, "sum"),
-                                    Events=(ref_flag_col, "size"),
-                                    Spend=(spend_col, "sum") if spend_col else (ref_flag_col, "size")
+                                    Events=("event_date", "size"),
+                                    Spend=(spend_col, "sum") if spend_col else ("event_date", "size")
                                 )
                             )
                             camp_summary["Referral Rate"] = np.where(

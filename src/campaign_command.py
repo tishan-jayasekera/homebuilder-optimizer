@@ -110,6 +110,8 @@ class CampaignCommandEngine:
         media_raw_df: Optional[pd.DataFrame] = None,
         budget: float = 50_000,
         as_of_date: Optional[pd.Timestamp] = None,
+        excluded_sources: Optional[List[str]] = None,
+        live_only: bool = True,
     ):
         self.events = events_df.copy()
         self.media_raw = media_raw_df
@@ -131,6 +133,12 @@ class CampaignCommandEngine:
             self.events.columns,
             ["ParentLeadId", "Parent_LeadId", "ParentLeadID", "ReferrerLeadId", "Referrer_LeadId", "RefLeadId"],
         )
+        self.status_col = _find_col(
+            self.events.columns,
+            ["STATUS_final", "Status_final", "status_final", "JobStatus", "Job_Status", "WIP_Status"],
+        )
+        self.excluded_sources = set(excluded_sources) if excluded_sources else set()
+        self.live_only = live_only
 
         for col in [self.lead_date_col, self.start_col, self.end_col, self.ref_date_col]:
             if col and col in self.events.columns:
@@ -154,6 +162,31 @@ class CampaignCommandEngine:
         else:
             self.events[self.cost_col] = pd.to_numeric(self.events[self.cost_col], errors="coerce").fillna(0.0)
 
+        # Filter to live jobs only
+        if self.live_only and self.status_col:
+            pre_filter_count = len(self.events)
+            live_mask = self.events[self.status_col].astype(str).str.strip().str.lower() == "live"
+            self.events = self.events[live_mask].copy()
+            self._filter_stats = {
+                "pre_filter": pre_filter_count,
+                "post_filter": len(self.events),
+                "removed": pre_filter_count - len(self.events),
+            }
+        else:
+            self._filter_stats = None
+
+        # Build job-level composite key
+        self.job_key_col = "_job_key"
+        if self.dest_col and self.start_col and self.end_col and self.target_col:
+            self.events[self.job_key_col] = (
+                self.events[self.dest_col].astype(str) + " | " +
+                self.events[self.start_col].astype(str).str[:10] + " \u2192 " +
+                self.events[self.end_col].astype(str).str[:10] + " | T:" +
+                self.events[self.target_col].astype(str)
+            )
+        elif self.dest_col:
+            self.events[self.job_key_col] = self.events[self.dest_col].astype(str)
+
     def _median_conversion_lag(self, campaign: str) -> float:
         if not self.dest_col or not self.ref_date_col or not self.lead_date_col:
             return 0.0
@@ -164,6 +197,18 @@ class CampaignCommandEngine:
             return 0.0
         subset["_lag_days"] = (subset[self.ref_date_col] - subset[self.lead_date_col]).dt.days
         return float(subset["_lag_days"].median()) if not subset.empty else 0.0
+
+    def _median_conversion_lag_job(self, job_key: str) -> float:
+        """Median referral lag scoped to a specific job."""
+        if not self.ref_date_col or not self.lead_date_col:
+            return 0.0
+        subset = self.events[
+            (self.events[self.job_key_col] == job_key) & self.events[self.ref_date_col].notna()
+        ].copy()
+        if subset.empty:
+            return self._global_referral_lag()
+        subset["_lag_days"] = (subset[self.ref_date_col] - subset[self.lead_date_col]).dt.days
+        return float(subset["_lag_days"].median())
 
     def _global_referral_lag(self) -> float:
         if not self.ref_date_col or not self.lead_date_col:
@@ -177,35 +222,41 @@ class CampaignCommandEngine:
     def compute_campaign_status(self) -> pd.DataFrame:
         if not self.dest_col or not self.target_col:
             return pd.DataFrame()
-        targets = self.events[[self.dest_col, self.target_col]].dropna(subset=[self.dest_col, self.target_col]).drop_duplicates(self.dest_col)
+
+        job_cols = [self.dest_col, self.target_col]
+        if self.start_col:
+            job_cols.append(self.start_col)
+        if self.end_col:
+            job_cols.append(self.end_col)
+
+        targets = (
+            self.events[job_cols + [self.job_key_col]]
+            .dropna(subset=[self.dest_col, self.target_col])
+            .drop_duplicates(self.job_key_col)
+        )
         targets[self.target_col] = pd.to_numeric(targets[self.target_col], errors="coerce")
         targets = targets[targets[self.target_col] > 0]
         if targets.empty:
             return pd.DataFrame()
 
-        start_series = self.events.groupby(self.dest_col)[self.start_col].min() if self.start_col else pd.Series(dtype="datetime64[ns]")
-        end_series = self.events.groupby(self.dest_col)[self.end_col].max() if self.end_col else pd.Series(dtype="datetime64[ns]")
-        lead_min_series = self.events.groupby(self.dest_col)[self.lead_date_col].min() if self.lead_date_col else pd.Series(dtype="datetime64[ns]")
-        leads_actual_series = self.events.groupby(self.dest_col).size()
+        leads_actual_series = self.events.groupby(self.job_key_col).size()
 
         rows: List[CampaignStatus] = []
         now = pd.Timestamp(self.as_of_date)
 
         for _, row in targets.iterrows():
-            campaign = row[self.dest_col]
+            job_key = row[self.job_key_col]
             target = float(row[self.target_col])
 
-            job_start = start_series.get(campaign, pd.NaT)
-            if pd.isna(job_start):
-                job_start = lead_min_series.get(campaign, pd.NaT)
+            job_start = pd.to_datetime(row.get(self.start_col), errors="coerce") if self.start_col else pd.NaT
             if pd.isna(job_start):
                 job_start = now - pd.Timedelta(days=30)
 
-            job_end = end_series.get(campaign, pd.NaT)
+            job_end = pd.to_datetime(row.get(self.end_col), errors="coerce") if self.end_col else pd.NaT
             if pd.isna(job_end):
                 job_end = now + pd.Timedelta(days=60)
 
-            leads_actual = float(leads_actual_series.get(campaign, 0))
+            leads_actual = float(leads_actual_series.get(job_key, 0))
 
             days_elapsed = max((now - job_start).days, 1)
             days_remaining = max((job_end - now).days, 0)
@@ -214,7 +265,7 @@ class CampaignCommandEngine:
             actual_pace = _safe_div(leads_actual, days_elapsed, default=0.0)
             leads_remaining = max(target - leads_actual, 0.0)
 
-            lag = self._median_conversion_lag(campaign)
+            lag = self._median_conversion_lag_job(job_key)
             effective_days = max(days_remaining - lag, 0)
 
             projected_additional = actual_pace * effective_days
@@ -242,7 +293,7 @@ class CampaignCommandEngine:
             urgency = shortfall_norm + time_pressure + pace_penalty
 
             rows.append(CampaignStatus(
-                campaign=campaign,
+                campaign=job_key,
                 lead_target=target,
                 leads_actual=leads_actual,
                 leads_remaining=leads_remaining,
@@ -273,14 +324,18 @@ class CampaignCommandEngine:
         for _, row in status_df.iterrows():
             if row.get("shortfall", 0) <= 0:
                 continue
-            campaign = row["campaign"]
-            subset = self.events[self.events[self.dest_col] == campaign]
+            job_key = row["campaign"]
+
+            subset = self.events[self.events[self.job_key_col] == job_key]
             direct_events = subset[subset[self.is_origin_col]]
             direct_count = len(direct_events)
             if direct_count == 0:
                 cpl = float("inf")
             else:
-                cpl = _safe_div(direct_events[self.cost_col].sum(), direct_count, default=0.0)
+                total_cost = direct_events[self.cost_col].sum()
+                cpl = _safe_div(total_cost, direct_count, default=0.0)
+                if cpl <= 0:
+                    cpl = float("inf")
             if direct_count >= 50:
                 confidence = "High"
             elif direct_count >= 15:
@@ -288,8 +343,8 @@ class CampaignCommandEngine:
             else:
                 confidence = "Low"
             projected_cost = row["shortfall"] * cpl if np.isfinite(cpl) else float("inf")
-            options[campaign] = DirectOption(
-                campaign=campaign,
+            options[job_key] = DirectOption(
+                campaign=job_key,
                 historical_cpl=float(cpl),
                 projected_leads=float(row["shortfall"]),
                 projected_cost=float(projected_cost),
@@ -298,50 +353,69 @@ class CampaignCommandEngine:
         return options
 
     def compute_network_options(self, status_df: pd.DataFrame) -> Dict[str, List[NetworkOption]]:
-        options: Dict[str, List[NetworkOption]] = {c: [] for c in status_df["campaign"].tolist()} if not status_df.empty else {}
+        options: Dict[str, List[NetworkOption]] = {
+            c: [] for c in status_df["campaign"].tolist()
+        } if not status_df.empty else {}
+
         if status_df.empty or not self.dest_col or not self.payer_col:
             return options
+
         refs = self.events[self.events[self.is_ref_col]].copy()
         if refs.empty:
             return options
 
-        flows = refs.groupby([self.payer_col, self.dest_col]).size().reset_index(name="ref_count")
+        flows = refs.groupby([self.payer_col, self.job_key_col]).size().reset_index(name="ref_count")
         if flows.empty:
             return options
 
-        total_by_source = flows.groupby(self.payer_col)["ref_count"].sum()
+        total_refs_by_source = refs.groupby(self.payer_col).size()
         total_leads_by_source = self.events.groupby(self.payer_col).size()
         direct_by_source = self.events[self.events[self.is_origin_col]].groupby(self.payer_col).size()
 
         source_spend = self.events.groupby(self.payer_col)[self.cost_col].sum()
-        source_cpl = source_spend / total_leads_by_source
+
+        source_cpl = {}
+        for source in source_spend.index:
+            direct_count = direct_by_source.get(source, 0)
+            if direct_count > 0:
+                source_cpl[source] = source_spend[source] / direct_count
+            else:
+                source_cpl[source] = float("inf")
 
         rm = {}
         for source, total in total_leads_by_source.items():
             direct = direct_by_source.get(source, 0)
             rm[source] = _safe_div(total, direct, default=1.0) if direct > 0 else 1.0
 
-        shortfall_targets = status_df[status_df["shortfall"] > 0]["campaign"].tolist()
-        for target in shortfall_targets:
-            target_flows = flows[flows[self.dest_col] == target]
+        shortfall_jobs = status_df[status_df["shortfall"] > 0]["campaign"].tolist()
+        for job_key in shortfall_jobs:
+            target_flows = flows[flows[self.job_key_col] == job_key]
             if target_flows.empty:
-                options[target] = []
+                options[job_key] = []
                 continue
+
             rows: List[NetworkOption] = []
-            shortfall = float(status_df.loc[status_df["campaign"] == target, "shortfall"].iloc[0])
+            shortfall = float(status_df.loc[status_df["campaign"] == job_key, "shortfall"].iloc[0])
+
             for _, flow in target_flows.iterrows():
                 source = flow[self.payer_col]
+                if source in self.excluded_sources:
+                    continue
+
                 ref_count = flow["ref_count"]
-                total_refs = total_by_source.get(source, 0)
+                total_refs = total_refs_by_source.get(source, 0)
                 transfer_rate = _safe_div(ref_count, total_refs, default=0.0)
                 source_cpl_val = source_cpl.get(source, float("inf"))
+
                 if not np.isfinite(source_cpl_val) or source_cpl_val <= 0 or transfer_rate <= 0:
                     effective_cpr = float("inf")
                 else:
                     effective_cpr = source_cpl_val / transfer_rate
+
                 rm_val = rm.get(source, 1.0)
                 system_cpr = effective_cpr / rm_val if rm_val > 0 else float("inf")
                 leakage_pct = 1 - transfer_rate
+
                 if transfer_rate > 0 and np.isfinite(source_cpl_val) and source_cpl_val > 0:
                     projected_cost = (shortfall / transfer_rate) * source_cpl_val
                     leakage_leads = (shortfall / transfer_rate) * leakage_pct
@@ -351,7 +425,7 @@ class CampaignCommandEngine:
 
                 rows.append(NetworkOption(
                     source_campaign=source,
-                    target_campaign=target,
+                    target_campaign=job_key,
                     transfer_rate=float(transfer_rate),
                     source_cpl=float(source_cpl_val),
                     effective_cpr=float(effective_cpr),
@@ -362,8 +436,10 @@ class CampaignCommandEngine:
                     leakage_pct=float(leakage_pct),
                     leakage_leads=float(leakage_leads),
                 ))
+
             rows = sorted(rows, key=lambda r: r.effective_cpr)
-            options[target] = rows
+            options[job_key] = rows
+
         return options
 
     def build_allocation_plan(
@@ -671,6 +747,25 @@ class CampaignCommandEngine:
             "blended_cpr": _safe_div(total_planned_spend, total_planned_leads, default=0.0),
         }
 
+        if not status_df.empty and self.dest_col:
+            builder_map = self.events.groupby(self.job_key_col)[self.dest_col].first()
+            status_with_builder = status_df.copy()
+            status_with_builder["builder"] = status_with_builder["campaign"].map(builder_map)
+            builder_summary = status_with_builder.groupby("builder").agg(
+                total_jobs=("campaign", "size"),
+                total_target=("lead_target", "sum"),
+                total_actual=("leads_actual", "sum"),
+                total_shortfall=("shortfall", "sum"),
+                jobs_critical=("pace_status", lambda s: (s == "Critical").sum()),
+                jobs_at_risk=("pace_status", lambda s: (s == "At Risk").sum()),
+                avg_pace_ratio=("pace_ratio", "mean"),
+                max_urgency=("urgency_score", "max"),
+            ).reset_index().sort_values("max_urgency", ascending=False)
+            summary["builder_summary"] = builder_summary.to_dict(orient="records")
+
+        if self._filter_stats:
+            summary["filter_stats"] = self._filter_stats
+
         return CampaignPlan(
             status_table=status_df,
             allocations=alloc_df,
@@ -696,5 +791,8 @@ class CampaignCommandEngine:
             plan.allocations.to_excel(writer, sheet_name="Allocation Plan", index=False)
             plan.reconciliation.to_excel(writer, sheet_name="Reconciliation", index=False)
             plan.timing_alerts.to_excel(writer, sheet_name="Timing Alerts", index=False)
+            if "builder_summary" in plan.summary:
+                builder_df = pd.DataFrame(plan.summary["builder_summary"])
+                builder_df.to_excel(writer, sheet_name="Builder Summary", index=False)
 
         return buf.getvalue()

@@ -462,17 +462,44 @@ with st.sidebar:
         "Available Budget ($)", min_value=1000, max_value=5_000_000,
         value=50_000, step=5_000, key="cmd_budget",
     )
+    cmd_live_only = st.checkbox(
+        "Live Jobs Only",
+        value=True,
+        help="Exclude completed/cancelled/paused jobs (uses STATUS_final column)",
+        key="cmd_live_only",
+    )
+    all_sources = sorted(
+        events["MediaPayer_BuilderRegionKey"].dropna().unique().tolist()
+    ) if "MediaPayer_BuilderRegionKey" in events.columns else []
+    excluded_sources = st.multiselect(
+        "Exclude Sources",
+        options=all_sources,
+        default=[],
+        help="Block these builders from being used as network sources",
+        key="cmd_excluded_sources",
+    )
 
 _cmd_engine = CampaignCommandEngine(
     events_df=events,
     media_raw_df=media_raw,
     budget=cmd_budget,
+    excluded_sources=excluded_sources,
+    live_only=cmd_live_only,
 )
 _cmd_plan = _cmd_engine.generate_plan()
 
 if not _cmd_plan.summary or "error" in _cmd_plan.summary:
     st.caption("No campaign targets found. Ensure LeadTarget_from_job and Dest_BuilderRegionKey exist in data.")
 else:
+    filter_stats = _cmd_plan.summary.get("filter_stats")
+    if filter_stats:
+        st.caption(
+            f"Filtered to Live jobs: {filter_stats['post_filter']:,} events "
+            f"({filter_stats['removed']:,} excluded from {filter_stats['pre_filter']:,} total)"
+        )
+    elif cmd_live_only:
+        st.caption("STATUS_final column not found — showing all jobs. Upload data with STATUS_final to enable filtering.")
+
     st.markdown(
         """
 <style>
@@ -621,18 +648,18 @@ else:
             lag_series = status_df["lag_days"] if "lag_days" in status_df.columns else np.nan
             effective_series = status_df["effective_days_remaining"] if "effective_days_remaining" in status_df.columns else np.nan
             triage_df = pd.DataFrame({
-                "Campaign": status_df["campaign"],
+                "Job": status_df["campaign"],
                 "Target": status_df["lead_target"],
                 "Actual": status_df["leads_actual"],
                 "Proj. Shortfall": status_df["shortfall"],
                 "Lag (d)": lag_series,
                 "Eff. Days Left": effective_series,
-                "Actual Pace/d": status_df["actual_pace"],
-                "Required Pace/d": status_df["required_pace"],
+                "Actual Pace/d": status_df["actual_pace"].map(lambda v: f"{v:.2f}"),
+                "Required Pace/d": status_df["required_pace"].map(lambda v: f"{v:.2f}"),
                 "Pace Ratio": status_df["pace_ratio"].map(lambda v: f"{v:.2f}x"),
                 "Status": status_df["pace_status"],
                 "Days Left": status_df["days_remaining"],
-                "Urgency": status_df["urgency_score"],
+                "Urgency": status_df["urgency_score"].map(lambda v: f"{v:.1f}"),
             })
             st.dataframe(triage_df, use_container_width=True, hide_index=True)
             st.caption("Pace ratio below 1.0 means current pace is behind required pace.")
@@ -788,6 +815,25 @@ else:
                 ))
                 fig.update_layout(height=360, margin=dict(l=10, r=10, t=30, b=10))
                 st.plotly_chart(fig, use_container_width=True)
+
+    builder_data = _cmd_plan.summary.get("builder_summary")
+    if builder_data:
+        st.markdown("**Builder Summary (Aggregated from Jobs)**")
+        builder_df = pd.DataFrame(builder_data)
+        display_builder = builder_df.rename(columns={
+            "builder": "Builder",
+            "total_jobs": "Jobs",
+            "total_target": "Total Target",
+            "total_actual": "Total Actual",
+            "total_shortfall": "Total Shortfall",
+            "jobs_critical": "Critical",
+            "jobs_at_risk": "At Risk",
+            "avg_pace_ratio": "Avg Pace Ratio",
+            "max_urgency": "Max Urgency",
+        })
+        display_builder["Avg Pace Ratio"] = display_builder["Avg Pace Ratio"].map(lambda v: f"{v:.2f}x")
+        display_builder["Max Urgency"] = display_builder["Max Urgency"].map(lambda v: f"{v:.1f}")
+        st.dataframe(display_builder, use_container_width=True, hide_index=True)
 
     xlsx_bytes = CampaignCommandEngine.export_to_excel(_cmd_plan)
     st.download_button(
