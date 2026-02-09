@@ -22,28 +22,46 @@ st.set_page_config(page_title="Creative Dashboard", page_icon="🎨", layout="wi
 
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Source+Sans+3:wght@400;500;600&display=swap');
+:root {
+    --bg: #f8fafb;
+    --card: #ffffff;
+    --ink: #0f172a;
+    --muted: #64748b;
+    --border: #e2e8f0;
+    --accent: #0ea5a4;
+    --accent-2: #f97316;
+    --shadow: 0 12px 32px -24px rgba(15, 23, 42, 0.6);
+}
+html, body, [class*="css"] { font-family: 'Source Sans 3', sans-serif; background: var(--bg); color: var(--ink); }
 #MainMenu, footer, .stDeployButton { display: none; }
 
-.page-header { border-bottom: 1px solid #e5e7eb; padding-bottom: 1rem; margin-bottom: 1.5rem; }
-.page-title { font-size: 1.6rem; font-weight: 700; color: #111827; margin: 0; }
-.page-subtitle { color: #6b7280; font-size: 0.9rem; margin-top: 0.25rem; }
+.page-header {
+    background: linear-gradient(120deg, rgba(14,165,164,0.08), rgba(249,115,22,0.08));
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 1.1rem 1.2rem;
+    margin-bottom: 1.5rem;
+    box-shadow: var(--shadow);
+}
+.page-title { font-family: 'Space Grotesk', sans-serif; font-size: 1.8rem; font-weight: 700; color: var(--ink); margin: 0; }
+.page-subtitle { color: var(--muted); font-size: 0.95rem; margin-top: 0.25rem; }
 
 .section-header { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.75rem; }
-.section-num { background: linear-gradient(135deg, #111827, #374151); color: white; width: 24px; height: 24px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 0.75rem; font-weight: 600; }
-.section-title { font-size: 1rem; font-weight: 600; color: #111827; }
+.section-num { background: linear-gradient(135deg, #0f172a, #334155); color: white; width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 0.75rem; font-weight: 600; }
+.section-title { font-family: 'Space Grotesk', sans-serif; font-size: 1.05rem; font-weight: 600; color: var(--ink); letter-spacing: 0.01em; }
 
-.kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 0.75rem; margin-bottom: 1rem; }
-.kpi { background: #ffffff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 0.9rem; box-shadow: 0 1px 0 rgba(17, 24, 39, 0.04); }
-.kpi-label { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.05em; color: #6b7280; margin-bottom: 0.2rem; }
-.kpi-value { font-size: 1.25rem; font-weight: 700; color: #111827; }
+.kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0.75rem; margin-bottom: 1rem; }
+.kpi { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 0.95rem; box-shadow: 0 6px 18px -18px rgba(15, 23, 42, 0.5); }
+.kpi-label { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 0.2rem; }
+.kpi-value { font-size: 1.3rem; font-weight: 700; color: var(--ink); }
 
-.explainer { background: #f8fafc; border: 1px solid #e5e7eb; padding: 0.75rem 0.9rem; border-radius: 10px; margin: 0.6rem 0 1rem 0; }
-.explainer-title { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: #6b7280; margin-bottom: 0.35rem; font-weight: 600; }
-.explainer-text { color: #374151; font-size: 0.85rem; line-height: 1.45; }
-.section-card { background: #ffffff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 1rem; margin: 0.5rem 0 1.25rem 0; box-shadow: 0 10px 24px -20px rgba(17, 24, 39, 0.45); }
-.section-card .section-header { margin-bottom: 0.5rem; }
+.explainer { background: #f1f5f9; border: 1px solid var(--border); padding: 0.75rem 0.9rem; border-radius: 12px; margin: 0.6rem 0 1rem 0; }
+.explainer-title { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 0.35rem; font-weight: 600; }
+.explainer-text { color: #334155; font-size: 0.88rem; line-height: 1.5; }
+.section-card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 1rem 1.1rem; margin: 0.6rem 0 1.25rem 0; box-shadow: var(--shadow); }
+.section-card .section-header { margin-bottom: 0.4rem; }
+.section-divider { height: 1px; background: var(--border); margin: 1rem 0; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -124,6 +142,14 @@ def main():
     <div class="page-header">
         <h1 class="page-title">🎨 Creative Campaign Dashboard</h1>
         <p class="page-subtitle">Campaign and ad set performance, spend → leads → referrals, and media lag insights.</p>
+    </div>
+    """, unsafe_allow_html=True)
+    st.markdown("""
+    <div class="explainer">
+        <div class="explainer-title">Story flow</div>
+        <div class="explainer-text">
+            1) Start with the performance overview. 2) Scan campaign health and timing. 3) Drill into a campaign and ad set.
+        </div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -271,16 +297,11 @@ def main():
     <div class="section-card">
         <div class="section-header">
             <span class="section-num">1</span>
-            <span class="section-title">Campaign Performance Tracker</span>
+            <span class="section-title">Performance Overview</span>
         </div>
-    </div>
-    """, unsafe_allow_html=True)
-    st.markdown("""
-    <div class="explainer">
-        <div class="explainer-title">What this tells you</div>
         <div class="explainer-text">
-            Track spend → leads → referrals → CPR over time, and monitor revenue per event using <b>RPL_from_job</b>.
-            The tracker also estimates how long campaigns take to generate a first lead so you can spot underperformers early.
+            Start with the macro story: spend, lead volume, referral lift, and efficiency over time.
+            Use this to understand whether performance is trending in the right direction before drilling into campaigns.
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -325,7 +346,6 @@ def main():
         line=dict(color="#6366f1")
     ))
     spend_fig.update_layout(height=220, margin=dict(l=0, r=0, t=40, b=0), yaxis_title="Spend", title="Spend trend")
-    st.plotly_chart(spend_fig, use_container_width=True, config={"displayModeBar": False})
 
     volume_fig = go.Figure()
     volume_fig.add_trace(go.Bar(
@@ -347,7 +367,6 @@ def main():
         yaxis_title="Events",
         title="Lead → Referral volume"
     )
-    st.plotly_chart(volume_fig, use_container_width=True, config={"displayModeBar": False})
 
     efficiency_fig = go.Figure()
     efficiency_fig.add_trace(go.Scatter(
@@ -370,7 +389,6 @@ def main():
             yaxis2=dict(overlaying="y", side="right", title="Revenue / Event")
         )
     efficiency_fig.update_layout(height=240, margin=dict(l=0, r=0, t=40, b=0), yaxis_title="CPR", title="Efficiency (CPR + Revenue / Event)")
-    st.plotly_chart(efficiency_fig, use_container_width=True, config={"displayModeBar": False})
 
     st.markdown("**Funnel summary (current window)**")
     total_spend = ts_campaign["Spend"].sum()
@@ -389,7 +407,29 @@ def main():
         color_discrete_sequence=["#6366f1", "#22c55e", "#14b8a6", "#f59e0b"]
     )
     funnel_fig.update_layout(height=260, margin=dict(l=0, r=0, t=30, b=0), yaxis_title=None)
-    st.plotly_chart(funnel_fig, use_container_width=True, config={"displayModeBar": False})
+    col_a, col_b = st.columns([1.25, 1])
+    with col_a:
+        st.plotly_chart(spend_fig, use_container_width=True, config={"displayModeBar": False})
+    with col_b:
+        st.plotly_chart(efficiency_fig, use_container_width=True, config={"displayModeBar": False})
+
+    col_c, col_d = st.columns([1.25, 1])
+    with col_c:
+        st.plotly_chart(volume_fig, use_container_width=True, config={"displayModeBar": False})
+    with col_d:
+        st.plotly_chart(funnel_fig, use_container_width=True, config={"displayModeBar": False})
+
+    st.markdown("""
+    <div class="section-card">
+        <div class="section-header">
+            <span class="section-num">2</span>
+            <span class="section-title">Campaign Health & Timing</span>
+        </div>
+        <div class="explainer-text">
+            Identify which campaigns are slow to first lead and which are at risk, then compare their current efficiency.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
     st.markdown("**Time to first lead by campaign**")
     lag_basis = st.radio(
@@ -437,7 +477,18 @@ def main():
         color_discrete_map={"On-time": "#22c55e", "At risk": "#ef4444"}
     )
     lag_fig.update_layout(height=260, margin=dict(l=0, r=0, t=30, b=0), xaxis_title="Days to first lead", yaxis_title="Campaigns")
-    st.plotly_chart(lag_fig, use_container_width=True, config={"displayModeBar": False})
+    col_time, col_risk = st.columns([1.25, 1])
+    with col_time:
+        st.plotly_chart(lag_fig, use_container_width=True, config={"displayModeBar": False})
+    with col_risk:
+        st.markdown("**Campaigns at risk (slow to first lead)**")
+        st.dataframe(
+            campaign_first[campaign_first["Status"] == "At risk"]
+            .sort_values("Days_to_First_Lead", ascending=False)
+            .head(20)
+            .rename(columns={campaign_col: "Campaign"}),
+            hide_index=True
+        )
 
     st.markdown("**Campaign performance (current window)**")
     def _campaign_summary(g):
@@ -471,6 +522,18 @@ def main():
         camp_perf.sort_values(["Status", "CPR"], ascending=[True, True]).rename(columns={campaign_col: "Campaign"}),
         hide_index=True
     )
+
+    st.markdown("""
+    <div class="section-card">
+        <div class="section-header">
+            <span class="section-num">3</span>
+            <span class="section-title">Campaign Explorer</span>
+        </div>
+        <div class="explainer-text">
+            Drill into a single campaign and ad set to understand volume, efficiency, destinations, and media lag.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
     st.markdown("**Single campaign view (ad set breakdown)**")
     campaign_pick = st.selectbox(
@@ -631,6 +694,8 @@ def main():
     })
     st.dataframe(trace_df, hide_index=True, use_container_width=True)
 
+    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+    st.markdown("**Attribution & reconciliation**")
     if lead_id_col and parent_id_col:
         parent_cols = [lead_id_col, campaign_col, lead_flag_col]
         if adset_col and adset_col in df.columns:
@@ -716,6 +781,8 @@ def main():
             "(LeadId/ParentLeadId/ReferrerLeadId or Deals: Id + Original Deal ID)."
         )
 
+    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+    st.markdown("**Trend diagnostics**")
     tmp = c_df.assign(period=c_df["event_date"].dt.to_period(trend_period).dt.start_time)
     def _detail_summary(g):
         leads, refs, events, _ = _count_leads_refs(g)
@@ -788,6 +855,7 @@ def main():
     c_eff.update_layout(height=200, margin=dict(l=0, r=0, t=30, b=0), yaxis_title="Value", title=eff_title)
     st.plotly_chart(c_eff, use_container_width=True, config={"displayModeBar": False})
 
+    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
     st.markdown("**Destination mix over time (leads vs referrals)**")
     dest_col = "Dest_BuilderRegionKey"
     if dest_col not in c_df.columns:
@@ -848,6 +916,7 @@ def main():
                 mix_fig.for_each_annotation(lambda a: a.update(text=a.text.replace("Metric=", "")))
                 st.plotly_chart(mix_fig, use_container_width=True, config={"displayModeBar": False})
 
+    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
     st.markdown("**Media spend & FB lead conversion (media_raw_base_phase0)**")
     if media_raw is None:
         st.caption("Upload media_raw_base_phase0 to enable media enrichment.")
@@ -972,6 +1041,7 @@ def main():
                 )
                 st.plotly_chart(conv_fig, use_container_width=True, config={"displayModeBar": False})
 
+    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
     st.markdown("**Empirical lag estimate (media spend → referrals)**")
     if media_raw is None:
         st.caption("Upload media_raw_base_phase0 to enable lag estimation.")
@@ -1134,6 +1204,7 @@ def main():
                     else:
                         st.caption("Not enough variation to compute lag correlation.")
 
+    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
     st.markdown("**Budget deployment → referral peak**")
     st.markdown("""
     <div class="explainer">
@@ -1340,16 +1411,6 @@ def main():
                                     title="Budget deployment vs referral peak"
                                 )
                                 st.plotly_chart(peak_fig, use_container_width=True, config={"displayModeBar": False})
-
-    st.markdown("**Campaigns at risk (slow to first lead)**")
-    st.dataframe(
-        campaign_first[campaign_first["Status"] == "At risk"]
-        .sort_values("Days_to_First_Lead", ascending=False)
-        .head(20)
-        .rename(columns={campaign_col: "Campaign"}),
-        hide_index=True
-    )
-
 
 if __name__ == "__main__":
     main()
