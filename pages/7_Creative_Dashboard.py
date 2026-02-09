@@ -186,6 +186,7 @@ def main():
         df = df[df["Dest_BuilderRegionKey"].isin(builder_filter)]
 
     campaign_col = _find_col(df.columns, ["utm_campaign", "utm_key", "ad_key"])
+    utm_campaign_col = _find_col(df.columns, ["utm_campaign"])
     spend_col = _find_col(df.columns, ["MediaCost_referral_event", "MediaCost_builder_touch", "MediaCost_origin_lead"])
     original_deal_col = _find_col(
         df.columns,
@@ -390,23 +391,6 @@ def main():
         )
     efficiency_fig.update_layout(height=240, margin=dict(l=0, r=0, t=40, b=0), yaxis_title="CPR", title="Efficiency (CPR + Revenue / Event)")
 
-    st.markdown("**Funnel summary (current window)**")
-    total_spend = ts_campaign["Spend"].sum()
-    total_leads = ts_campaign["Leads"].sum()
-    total_refs = ts_campaign["Referrals"].sum()
-    total_revenue = ts_campaign["Revenue"].sum()
-    funnel_df = pd.DataFrame({
-        "Stage": ["Spend", "Leads", "Referrals", "Revenue"],
-        "Value": [total_spend, total_leads, total_refs, total_revenue]
-    })
-    funnel_fig = px.bar(
-        funnel_df,
-        x="Stage",
-        y="Value",
-        color="Stage",
-        color_discrete_sequence=["#6366f1", "#22c55e", "#14b8a6", "#f59e0b"]
-    )
-    funnel_fig.update_layout(height=260, margin=dict(l=0, r=0, t=30, b=0), yaxis_title=None)
     col_a, col_b = st.columns([1.25, 1])
     with col_a:
         st.plotly_chart(spend_fig, use_container_width=True, config={"displayModeBar": False})
@@ -417,7 +401,109 @@ def main():
     with col_c:
         st.plotly_chart(volume_fig, use_container_width=True, config={"displayModeBar": False})
     with col_d:
+        st.caption("Use the funnel below to see how spend turns into qualified leads, referrals, and profit.")
+
+    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+    st.markdown("**Funnel & unit economics (current window)**")
+
+    media_spend_total = None
+    fb_leads_total = None
+    days_to_first_fb = None
+    media_note = "Media spend uses media_raw_base_phase0. "
+    if media_raw is not None:
+        media = media_raw.copy()
+        report_col = _find_col(media.columns, ["Report: Date", "Report Date", "Report:Date", "Date"])
+        spend_col_media = _find_col(
+            media.columns,
+            ["Cost: Amount spend", "Cost: Amount spent", "Cost: Amount Spent", "Amount Spent", "Spend"]
+        )
+        conv_col_media = _find_col(
+            media.columns,
+            [
+                "Conversions: All On-Facebook Leads - Total",
+                "Conversions: All On-Facebook Leads - Total (All)",
+                "Conversions: All On-Facebook Leads - Total - All"
+            ]
+        )
+        camp_col_media = _find_col(media.columns, ["Campaign: Campaign name"])
+        if report_col and spend_col_media and conv_col_media and camp_col_media:
+            media[report_col] = pd.to_datetime(media[report_col], errors="coerce")
+            media = media.dropna(subset=[report_col])
+            media = media[
+                (media[report_col] >= pd.Timestamp(start_d)) &
+                (media[report_col] <= pd.Timestamp(end_d))
+            ]
+            if utm_campaign_col and utm_campaign_col in df.columns:
+                campaign_set = set(df[utm_campaign_col].dropna().astype(str))
+                if campaign_set:
+                    media = media[media[camp_col_media].astype(str).isin(campaign_set)]
+                    media_note += "Filtered to campaigns present in events (utm_campaign)."
+                else:
+                    media_note += "No utm_campaign values found for filtering."
+            if not media.empty:
+                media[spend_col_media] = pd.to_numeric(media[spend_col_media], errors="coerce").fillna(0.0)
+                media[conv_col_media] = pd.to_numeric(media[conv_col_media], errors="coerce").fillna(0.0)
+                media_spend_total = float(media[spend_col_media].sum())
+                fb_leads_total = float(media[conv_col_media].sum())
+
+                spend_pos = media[media[spend_col_media] > 0]
+                leads_pos = media[media[conv_col_media] > 0]
+                if not spend_pos.empty and not leads_pos.empty:
+                    first_spend = spend_pos.groupby(camp_col_media)[report_col].min()
+                    first_lead = leads_pos.groupby(camp_col_media)[report_col].min()
+                    lead_lag = (first_lead - first_spend).dt.days.dropna()
+                    lead_lag = lead_lag[lead_lag >= 0]
+                    if not lead_lag.empty:
+                        days_to_first_fb = int(np.median(lead_lag))
+        else:
+            media_note += "Media columns missing; using event spend for profit."
+    else:
+        media_note += "Media file not loaded; using event spend for profit."
+
+    total_leads = _count_leads_refs(df)[0]
+    total_refs = _count_leads_refs(df)[1]
+    total_revenue = float(df["_event_revenue"].sum(min_count=1))
+    if np.isnan(total_revenue):
+        total_revenue = 0.0
+    total_spend = media_spend_total if media_spend_total is not None else float(df["_event_spend"].sum())
+    profit = total_revenue - total_spend
+    profit_margin = _safe_div(profit, total_revenue)
+
+    qual_rate = _safe_div(total_leads, fb_leads_total) if fb_leads_total is not None else np.nan
+    ref_multiplier = _safe_div(total_refs, total_leads)
+
+    funnel_left, funnel_right = st.columns([1.2, 1])
+    with funnel_left:
+        if fb_leads_total is None:
+            st.caption("FB lead volume unavailable (media file missing or not mapped). Funnel shows qualified → referrals only.")
+            funnel_vals = [total_leads, total_refs]
+            funnel_labels = ["Qualified Leads", "Referrals"]
+        else:
+            funnel_vals = [fb_leads_total, total_leads, total_refs]
+            funnel_labels = ["FB Leads (Unqualified)", "Qualified Leads", "Referrals"]
+        funnel_fig = px.funnel(
+            x=funnel_vals,
+            y=funnel_labels
+        )
+        funnel_fig.update_layout(height=260, margin=dict(l=0, r=0, t=20, b=0))
         st.plotly_chart(funnel_fig, use_container_width=True, config={"displayModeBar": False})
+
+    with funnel_right:
+        st.markdown(f"""
+        <div class="kpi-row">
+            <div class="kpi"><div class="kpi-label">Media Spend</div><div class="kpi-value">${_fmt(total_spend)}</div></div>
+            <div class="kpi"><div class="kpi-label">Days to 1st FB Lead</div><div class="kpi-value">{_fmt(days_to_first_fb) if days_to_first_fb is not None else "—"}</div></div>
+            <div class="kpi"><div class="kpi-label">Qualified / FB</div><div class="kpi-value">{_fmt(qual_rate, fmt="{:.1%}")}</div></div>
+        </div>
+        """, unsafe_allow_html=True)
+        st.markdown(f"""
+        <div class="kpi-row">
+            <div class="kpi"><div class="kpi-label">Referrals / Qualified</div><div class="kpi-value">{_fmt(ref_multiplier, fmt="{:.2f}x")}</div></div>
+            <div class="kpi"><div class="kpi-label">Revenue</div><div class="kpi-value">${_fmt(total_revenue)}</div></div>
+            <div class="kpi"><div class="kpi-label">Profit / Margin</div><div class="kpi-value">${_fmt(profit)} · {_fmt(profit_margin, fmt="{:.1%}")}</div></div>
+        </div>
+        """, unsafe_allow_html=True)
+        st.caption(media_note)
 
     st.markdown("""
     <div class="section-card">
@@ -439,6 +525,8 @@ def main():
     )
     expected_days = st.slider("Expected days to first lead", 1, 30, 10, step=1)
     df["_has_spend"] = df["_event_spend"] > 0
+    df["_lead_event_date"] = df["lead_date"]
+    df["_lead_event_date"] = df["_lead_event_date"].fillna(df["event_date"])
     if use_unique_ids and original_deal_col and deal_id_col and "_original_deal_id" in df.columns and "_deal_id" in df.columns:
         df["_is_lead_event"] = (
             df["_original_deal_id"].notna() &
@@ -453,7 +541,7 @@ def main():
         .agg(
             First_Event=("event_date", "min"),
             First_Spend=("event_date", lambda x: x[df.loc[x.index, "_has_spend"]].min()),
-            First_Lead=("event_date", lambda x: x[df.loc[x.index, "_is_lead_event"]].min())
+            First_Lead=("_lead_event_date", lambda x: x[df.loc[x.index, "_is_lead_event"]].min())
         )
     )
     if lag_basis == "First spend event":
