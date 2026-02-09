@@ -768,6 +768,122 @@ def main():
     if not rpl_col:
         st.caption("Revenue metrics require RPL_from_job. Revenue/ROAS are blank when unavailable.")
 
+    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+    st.markdown("**Funnel & unit economics (campaign/ad set)**")
+    st.markdown("""
+    <div class="explainer">
+        <div class="explainer-title">What this shows</div>
+        <div class="explainer-text">
+            Tracks the flow from FB leads → qualified leads → referrals for the selected campaign/ad set.
+            Qualified leads use <b>lead_date</b>; referrals use <b>RefDate</b>. This makes the conversion timing explicit.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    media_spend_scope = None
+    fb_leads_scope = None
+    first_fb_date = None
+    media_note = "Media spend uses media_raw_base_phase0."
+    if media_raw is None:
+        media_note = "Media file not loaded; spend/profit use event spend."
+    else:
+        media_scope = media_raw.copy()
+        report_col = _find_col(media_scope.columns, ["Report: Date", "Report Date", "Report:Date", "Date"])
+        spend_col_media = _find_col(
+            media_scope.columns,
+            ["Cost: Amount spend", "Cost: Amount spent", "Cost: Amount Spent", "Amount Spent", "Spend"]
+        )
+        conv_col_media = _find_col(
+            media_scope.columns,
+            [
+                "Conversions: All On-Facebook Leads - Total",
+                "Conversions: All On-Facebook Leads - Total (All)",
+                "Conversions: All On-Facebook Leads - Total - All"
+            ]
+        )
+        camp_col_media = _find_col(media_scope.columns, ["Campaign: Campaign name"])
+        ad_group_col_media = _find_col(media_scope.columns, ["Ad group: Ad group name"])
+        if report_col and spend_col_media and conv_col_media and camp_col_media and ad_group_col_media:
+            media_scope[report_col] = pd.to_datetime(media_scope[report_col], errors="coerce")
+            media_scope = media_scope.dropna(subset=[report_col])
+            media_scope = media_scope[
+                (media_scope[report_col] >= pd.Timestamp(start_d)) &
+                (media_scope[report_col] <= pd.Timestamp(end_d))
+            ]
+            media_scope = media_scope[media_scope[camp_col_media].astype(str) == str(campaign_pick)]
+            if adset_pick and adset_col:
+                media_scope = media_scope[media_scope[ad_group_col_media].astype(str) == str(adset_pick)]
+            if media_scope.empty:
+                media_note = "No media rows match the selected campaign/ad set in the date range."
+            else:
+                media_scope[spend_col_media] = pd.to_numeric(media_scope[spend_col_media], errors="coerce").fillna(0.0)
+                media_scope[conv_col_media] = pd.to_numeric(media_scope[conv_col_media], errors="coerce").fillna(0.0)
+                media_spend_scope = float(media_scope[spend_col_media].sum())
+                fb_leads_scope = float(media_scope[conv_col_media].sum())
+                fb_pos = media_scope[media_scope[conv_col_media] > 0]
+                if not fb_pos.empty:
+                    first_fb_date = fb_pos[report_col].min()
+        else:
+            media_note = "Media columns missing; spend/profit use event spend."
+
+    lead_dates = pd.to_datetime(c_df.get("lead_date"), errors="coerce")
+    ref_dates = pd.to_datetime(c_df.get("RefDate", c_df["event_date"]), errors="coerce")
+    lead_date_mask = (lead_dates >= pd.Timestamp(start_d)) & (lead_dates <= pd.Timestamp(end_d))
+    ref_date_mask = (ref_dates >= pd.Timestamp(start_d)) & (ref_dates <= pd.Timestamp(end_d))
+
+    if use_unique_ids and "_original_deal_id" in c_df.columns and "_deal_id" in c_df.columns:
+        orig_set_range = set(c_df.loc[lead_date_mask, "_original_deal_id"].dropna())
+        deal_set_range = set(c_df.loc[ref_date_mask, "_deal_id"].dropna())
+        qualified_count = len(orig_set_range)
+        referral_count = len(deal_set_range - orig_set_range)
+        lead_event_mask = c_df["_original_deal_id"].notna() & c_df["_deal_id"].notna() & (c_df["_original_deal_id"] == c_df["_deal_id"])
+    else:
+        lead_event_mask = c_df[lead_flag_col] if lead_flag_col in c_df.columns else (~c_df[ref_flag_col])
+        qualified_count = int((lead_event_mask & lead_date_mask).sum())
+        referral_count = int((c_df[ref_flag_col] & ref_date_mask).sum())
+
+    first_qual_date = lead_dates[lead_event_mask].min() if lead_dates.notna().any() else None
+    days_fb_to_qual = None
+    if first_fb_date is not None and pd.notna(first_qual_date):
+        days_fb_to_qual = int((pd.Timestamp(first_qual_date) - pd.Timestamp(first_fb_date)).days)
+
+    qual_rate = _safe_div(qualified_count, fb_leads_scope) if fb_leads_scope is not None else np.nan
+    ref_rate = _safe_div(referral_count, qualified_count)
+    scope_spend = media_spend_scope if media_spend_scope is not None else float(c_df["_event_spend"].sum())
+    scope_revenue = float(c_df["_event_revenue"].sum(min_count=1))
+    if np.isnan(scope_revenue):
+        scope_revenue = 0.0
+    scope_profit = scope_revenue - scope_spend
+    scope_margin = _safe_div(scope_profit, scope_revenue)
+
+    funnel_col_l, funnel_col_r = st.columns([1.2, 1])
+    with funnel_col_l:
+        if fb_leads_scope is None:
+            funnel_vals = [qualified_count, referral_count]
+            funnel_labels = ["Qualified Leads", "Referrals"]
+        else:
+            funnel_vals = [fb_leads_scope, qualified_count, referral_count]
+            funnel_labels = ["FB Leads (Unqualified)", "Qualified Leads", "Referrals"]
+        funnel_fig = px.funnel(x=funnel_vals, y=funnel_labels)
+        funnel_fig.update_layout(height=240, margin=dict(l=0, r=0, t=20, b=0))
+        st.plotly_chart(funnel_fig, use_container_width=True, config={"displayModeBar": False})
+    with funnel_col_r:
+        st.markdown(f"""
+        <div class="kpi-row">
+            <div class="kpi"><div class="kpi-label">Media Spend</div><div class="kpi-value">${_fmt(scope_spend)}</div></div>
+            <div class="kpi"><div class="kpi-label">First FB Lead</div><div class="kpi-value">{first_fb_date.date() if first_fb_date is not None else "—"}</div></div>
+            <div class="kpi"><div class="kpi-label">FB → Qualified</div><div class="kpi-value">{_fmt(qual_rate, fmt="{:.1%}")}</div></div>
+        </div>
+        """, unsafe_allow_html=True)
+        st.markdown(f"""
+        <div class="kpi-row">
+            <div class="kpi"><div class="kpi-label">Qualified → Referral</div><div class="kpi-value">{_fmt(ref_rate, fmt="{:.1%}")}</div></div>
+            <div class="kpi"><div class="kpi-label">FB → Qualified (days)</div><div class="kpi-value">{_fmt(days_fb_to_qual)}</div></div>
+            <div class="kpi"><div class="kpi-label">Profit / Margin</div><div class="kpi-value">${_fmt(scope_profit)} · {_fmt(scope_margin, fmt="{:.1%}")}</div></div>
+        </div>
+        """, unsafe_allow_html=True)
+        st.caption(media_note)
+
     st.markdown("**Spend trace (leads vs referrals)**")
     trace_df = pd.DataFrame({
         "Metric": ["Lead Spend", "Referral Spend", "Total Spend", "Leads", "Referrals", "Events"],
