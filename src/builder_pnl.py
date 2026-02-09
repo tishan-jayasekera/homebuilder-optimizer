@@ -65,6 +65,7 @@ def build_builder_pnl(
         ROAS, Margin_pct, N_events, N_origin, N_referrals, ProfitBucket
     """
     df = events_df.copy()
+    df, use_ids, _, _ = prepare_referral_ids(df, inplace=True)
     
     # Builder lens mapping
     lens_map = {

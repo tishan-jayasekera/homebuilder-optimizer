@@ -203,6 +203,41 @@ class NetworkOptimizer:
         
         # Build lookup tables
         self._build_lookups()
+
+    @staticmethod
+    def _compute_referral_stats(df: pd.DataFrame, group_col: str) -> Tuple[Dict, Dict]:
+        if df is None or df.empty or group_col not in df.columns:
+            return {}, {}
+        cost_col = "MediaCost_referral_event" if "MediaCost_referral_event" in df.columns else None
+
+        def _stats(g):
+            _, refs, _, orig_set = count_leads_refs(g)
+            _, ref_mask = lead_ref_masks(g, orig_set)
+            if cost_col:
+                spend = pd.to_numeric(g.loc[ref_mask, cost_col], errors="coerce").sum()
+            else:
+                spend = 0.0
+            return pd.Series({"referrals": refs, "referral_spend": spend})
+
+        grouped = (
+            df.groupby(group_col, dropna=False)
+            .apply(_stats)
+            .reset_index()
+            .dropna(subset=[group_col])
+        )
+        spend_map = (
+            grouped.set_index(group_col)["referral_spend"]
+            .fillna(0.0)
+            .astype(float)
+            .to_dict()
+        )
+        ref_map = (
+            grouped.set_index(group_col)["referrals"]
+            .fillna(0.0)
+            .astype(float)
+            .to_dict()
+        )
+        return spend_map, ref_map
     
     def _build_lookups(self):
         """Pre-compute lookup tables for efficiency."""
@@ -212,13 +247,26 @@ class NetworkOptimizer:
         self.media_cost = {}
         self.roas = {}
         self.total_refs_out = {}
+        self.source_ref_spend = {}
+        self.source_referrals = {}
+        self.target_ref_spend = {}
+        self.target_referrals = {}
+        
+        events_df, _, _, _ = prepare_referral_ids(self.events, inplace=False)
+        self.events = events_df
+        self.source_ref_spend, self.source_referrals = self._compute_referral_stats(
+            events_df, "MediaPayer_BuilderRegionKey"
+        )
+        self.target_ref_spend, self.target_referrals = self._compute_referral_stats(
+            events_df, "Dest_BuilderRegionKey"
+        )
+        self.media_cost = dict(self.source_ref_spend)
+        self.total_refs_out = dict(self.source_referrals)
         
         if not bm.empty:
             for _, row in bm.iterrows():
                 b = row['BuilderRegionKey']
-                self.media_cost[b] = float(row.get('MediaCost', 0))
                 self.roas[b] = float(row.get('ROAS', 0))
-                self.total_refs_out[b] = float(row.get('Referrals_out', 0))
         
         # Referral flows from leverage data
         self.flows = {}  # (source, dest) -> referrals
@@ -237,13 +285,8 @@ class NetworkOptimizer:
         paths = []
         
         # 1. DIRECT PATH: Spend directly on target
-        direct_cost = self.media_cost.get(target, 0)
-        direct_refs_in = 0
-        if not self.builder_master.empty and 'BuilderRegionKey' in self.builder_master.columns:
-            if 'Referrals_in' in self.builder_master.columns:
-                match = self.builder_master[self.builder_master['BuilderRegionKey'] == target]
-                if not match.empty:
-                    direct_refs_in = float(match['Referrals_in'].iloc[0])
+        direct_cost = float(self.target_ref_spend.get(target, 0))
+        direct_refs_in = float(self.target_referrals.get(target, 0))
         if direct_refs_in == 0 and not self.leverage.empty:
             direct_refs_in = float(
                 self.leverage[self.leverage['Dest_BuilderRegionKey'] == target]['Referrals_to_Target'].sum()
@@ -1650,6 +1693,7 @@ def main():
         
         # Allocation details
         st.markdown("**Recommended Allocation**")
+        st.caption("CPR uses referral-only spend (MediaCost_referral_event on referral events) ÷ reconciled referrals (Original Deal ID + Deals: Id).")
         
         if allocations:
             # Header
