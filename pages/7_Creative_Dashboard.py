@@ -1490,16 +1490,16 @@ def main():
                 (media[report_col] >= pd.Timestamp(start_d)) &
                 (media[report_col] <= pd.Timestamp(end_d))
             ]
-            media = media[media[camp_col_media].astype(str) == str(campaign_pick)]
+            media_all = media.copy()
+            media_all[spend_col_media] = pd.to_numeric(media_all[spend_col_media], errors="coerce").fillna(0.0)
+            if conv_col_media:
+                media_all[conv_col_media] = pd.to_numeric(media_all[conv_col_media], errors="coerce").fillna(0.0)
+            media = media_all[media_all[camp_col_media].astype(str) == str(campaign_pick)]
             if adset_pick and adset_col:
                 media = media[media[ad_group_col_media].astype(str) == str(adset_pick)]
             if media.empty:
                 st.caption("No media rows match the selected campaign/ad set in the chosen date range.")
             else:
-                media[spend_col_media] = pd.to_numeric(media[spend_col_media], errors="coerce").fillna(0.0)
-                if conv_col_media:
-                    media[conv_col_media] = pd.to_numeric(media[conv_col_media], errors="coerce").fillna(0.0)
-
                 date_index = pd.date_range(start=start_d, end=end_d, freq="D")
                 if len(date_index) < 14:
                     st.caption("Need at least 14 days of data to estimate a lagged response.")
@@ -1761,6 +1761,163 @@ def main():
                                 title="Estimated lag response curve"
                             )
                             st.plotly_chart(curve_fig, use_container_width=True, config={"displayModeBar": False})
+
+                            def _response_stats_for_series(x_vals: np.ndarray, y_vals: np.ndarray):
+                                if len(x_vals) < max_lag + 7:
+                                    return None
+                                if np.nanstd(x_vals) == 0:
+                                    return None
+                                dow_local = pd.Series(date_index).dt.dayofweek if include_dow else None
+                                beta_lag_b, y_hat_b, _, _, _ = _fit_ridge_response(
+                                    x_vals.astype(float),
+                                    y_vals.astype(float),
+                                    max_lag,
+                                    ridge_lambda,
+                                    dow_local,
+                                    include_trend
+                                )
+                                ss_tot_b = float(((y_vals - y_vals.mean()) ** 2).sum())
+                                ss_res_b = float(((y_vals - y_hat_b) ** 2).sum())
+                                r2_b = 1 - (ss_res_b / ss_tot_b) if ss_tot_b > 0 else np.nan
+                                response_b = beta_lag_b
+                                response_pos_b = np.clip(response_b, 0, None)
+                                total_b = response_pos_b.sum()
+                                if total_b <= 0:
+                                    return None
+                                weights_b = response_pos_b / total_b
+                                cum_b = np.cumsum(weights_b)
+                                return {
+                                    "peak_day": int(np.argmax(response_pos_b)),
+                                    "p50_day": int(np.searchsorted(cum_b, 0.5)),
+                                    "p80_day": int(np.searchsorted(cum_b, 0.8)),
+                                    "effect_per_1k": total_b * 1000,
+                                    "r2": r2_b
+                                }
+
+                            with st.expander("Benchmark vs other campaigns", expanded=False):
+                                if campaign_col is None or camp_col_media is None:
+                                    st.caption("Benchmarking needs campaign identifiers in both events and media data.")
+                                else:
+                                    if adset_pick:
+                                        st.caption("Benchmarking is campaign-level. Your current selection is an ad set.")
+                                    bench_n = st.slider(
+                                        "Max campaigns to benchmark",
+                                        5,
+                                        30,
+                                        10,
+                                        step=1,
+                                        key="budget_response_bench_n"
+                                    )
+                                    if media_all.empty:
+                                        st.caption("No media data available for benchmarking.")
+                                    else:
+                                        camp_spend = (
+                                            media_all.groupby(camp_col_media)[spend_col_media]
+                                            .sum()
+                                            .sort_values(ascending=False)
+                                        )
+                                        if camp_spend.empty:
+                                            st.caption("No spend data available for benchmarking.")
+                                        else:
+                                            candidates = [str(c) for c in camp_spend.head(bench_n).index.tolist()]
+                                            if str(campaign_pick) not in candidates:
+                                                candidates.append(str(campaign_pick))
+
+                                            ref_df_all = df[df[ref_flag_col] == True].copy()
+                                            ref_date_col = "RefDate" if "RefDate" in ref_df_all.columns else "event_date"
+                                            ref_df_all["_ref_date"] = pd.to_datetime(ref_df_all[ref_date_col], errors="coerce")
+                                            ref_df_all = ref_df_all.dropna(subset=["_ref_date"])
+                                            ref_df_all = ref_df_all[
+                                                (ref_df_all["_ref_date"] >= pd.Timestamp(start_d)) &
+                                                (ref_df_all["_ref_date"] <= pd.Timestamp(end_d))
+                                            ]
+
+                                            results = []
+                                            for camp in candidates:
+                                                media_c = media_all[media_all[camp_col_media].astype(str) == str(camp)]
+                                                if media_c.empty:
+                                                    continue
+                                                media_daily_c = (
+                                                    media_c.assign(date=media_c[report_col].dt.normalize())
+                                                    .groupby("date", as_index=False)
+                                                    .agg(
+                                                        Spend=(spend_col_media, "sum"),
+                                                        FB_Leads=(conv_col_media, "sum") if conv_col_media else (spend_col_media, "size")
+                                                    )
+                                                    .set_index("date")
+                                                    .reindex(date_index, fill_value=0.0)
+                                                )
+                                                x_vals = media_daily_c["FB_Leads"].values if signal_choice == "FB Leads" else media_daily_c["Spend"].values
+                                                ref_c = ref_df_all[ref_df_all[campaign_col].astype(str) == str(camp)]
+                                                if ref_c.empty:
+                                                    continue
+                                                if use_unique_ids and "_deal_id" in ref_c.columns:
+                                                    ref_daily_c = (
+                                                        ref_c.groupby(ref_c["_ref_date"].dt.normalize())["_deal_id"]
+                                                        .nunique()
+                                                        .reindex(date_index, fill_value=0)
+                                                    )
+                                                elif lead_id_col and lead_id_col in ref_c.columns:
+                                                    ref_daily_c = (
+                                                        ref_c.groupby(ref_c["_ref_date"].dt.normalize())[lead_id_col]
+                                                        .nunique()
+                                                        .reindex(date_index, fill_value=0)
+                                                    )
+                                                else:
+                                                    ref_daily_c = (
+                                                        ref_c.groupby(ref_c["_ref_date"].dt.normalize())
+                                                        .size()
+                                                        .reindex(date_index, fill_value=0)
+                                                    )
+                                                stats = _response_stats_for_series(x_vals, ref_daily_c.values)
+                                                if stats is None:
+                                                    continue
+                                                results.append({
+                                                    "Campaign": camp,
+                                                    "Peak Lag": stats["peak_day"],
+                                                    "P50": stats["p50_day"],
+                                                    "P80": stats["p80_day"],
+                                                    "Response / 1k": stats["effect_per_1k"],
+                                                    "R²": stats["r2"],
+                                                    "Signal Days": int((x_vals > 0).sum()),
+                                                    "Spend": float(media_c[spend_col_media].sum())
+                                                })
+
+                                            if not results:
+                                                st.caption("Not enough campaign data to benchmark response curves.")
+                                            else:
+                                                bench_df = pd.DataFrame(results)
+                                                label = "Response / 1k FB Leads" if signal_choice == "FB Leads" else "Response / $1k"
+                                                bench_df = bench_df.rename(columns={"Response / 1k": label})
+                                                bench_df = bench_df.sort_values(label, ascending=False)
+                                                st.dataframe(bench_df, hide_index=True, use_container_width=True)
+
+                                                summary_cols = [label, "Peak Lag", "P50", "P80", "R²", "Spend"]
+                                                summary_stats = bench_df[summary_cols].median(numeric_only=True)
+                                                st.markdown(f"""
+                                                <div class="kpi-row">
+                                                    <div class="kpi"><div class="kpi-label">Benchmarked Campaigns</div><div class="kpi-value">{len(bench_df)}</div></div>
+                                                    <div class="kpi"><div class="kpi-label">Median {label}</div><div class="kpi-value">{summary_stats[label]:.2f}</div></div>
+                                                    <div class="kpi"><div class="kpi-label">Median P50 (days)</div><div class="kpi-value">{summary_stats['P50']:.0f}</div></div>
+                                                    <div class="kpi"><div class="kpi-label">Median P80 (days)</div><div class="kpi-value">{summary_stats['P80']:.0f}</div></div>
+                                                    <div class="kpi"><div class="kpi-label">Median R²</div><div class="kpi-value">{summary_stats['R²']:.2f}</div></div>
+                                                    <div class="kpi"><div class="kpi-label">Median Spend</div><div class="kpi-value">${_fmt(summary_stats['Spend'])}</div></div>
+                                                </div>
+                                                """, unsafe_allow_html=True)
+
+                                                selected_row = bench_df[bench_df["Campaign"].astype(str) == str(campaign_pick)]
+                                                if not selected_row.empty:
+                                                    rank_series = bench_df[label].rank(pct=True)
+                                                    pct = float(rank_series.loc[selected_row.index[0]] * 100)
+                                                    selected_value = float(selected_row[label].iloc[0])
+                                                    delta = selected_value - summary_stats[label]
+                                                    st.caption(
+                                                        f"{campaign_pick} is at the {pct:.0f}th percentile for {label} "
+                                                        f"among the benchmarked campaigns. "
+                                                        f"Delta vs median: {delta:+.2f}."
+                                                    )
+                                                else:
+                                                    st.caption("Selected campaign is not included in the benchmark (insufficient data).")
 
                             st.markdown("**Spend size → conversion efficiency**")
                             st.markdown("""
