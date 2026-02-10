@@ -21,6 +21,7 @@ from src.normalization import normalize_events
 from src.optimization_engine import ReferralOptimizationEngine
 from src.attribution_engine import FullFunnelAttributor
 from src.campaign_command import CampaignCommandEngine
+from src.referral_logic import count_leads_refs
 
 
 st.set_page_config(
@@ -182,30 +183,41 @@ leaderboard = build_leaderboard(scores)
 
 # Apply custom weights to leaderboard score if weights sum > 0
 if not leaderboard.empty and weight_sum > 0:
-    conv = leaderboard["Conv %"].clip(0, 100)
-    rm_scaled = (leaderboard["RM"] * 20).clip(0, 100)
+    rm_scaled = (leaderboard["RM"] * 200).clip(0, 100)
     lag_score = leaderboard["Lag Score"].clip(0, 100)
     pace = leaderboard["Pacing Score"].clip(0, 100)
     eff = leaderboard["Efficiency"].clip(0, 100)
-    leaderboard["Score"] = (
-        weights["conversion"] * conv +
-        weights["referral_multiplier"] * rm_scaled +
-        weights["lag"] * lag_score +
-        weights["pacing"] * pace +
-        weights["efficiency"] * eff
-    ) / weight_sum
+
+    def _row_score(row):
+        total = 0.0
+        wsum = 0.0
+        if pd.notna(row["Conv %"]):
+            total += weights["conversion"] * min(100.0, max(row["Conv %"], 0.0))
+            wsum += weights["conversion"]
+        total += weights["referral_multiplier"] * row["RM_scaled"]
+        wsum += weights["referral_multiplier"]
+        total += weights["lag"] * row["Lag Score"]
+        wsum += weights["lag"]
+        total += weights["pacing"] * row["Pacing Score"]
+        wsum += weights["pacing"]
+        total += weights["efficiency"] * row["Efficiency"]
+        wsum += weights["efficiency"]
+        return (total / wsum) if wsum > 0 else 0.0
+
+    leaderboard = leaderboard.copy()
+    leaderboard["RM_scaled"] = rm_scaled
+    leaderboard["Score"] = leaderboard.apply(_row_score, axis=1)
 
 # Top metrics
 rm_overall = None
-if "is_origin" in events.columns:
-    direct = events["is_origin"].sum()
-    total = len(events)
-    rm_overall = (total / direct) if direct > 0 else 1.0
+overall_leads, overall_refs, overall_events, _ = count_leads_refs(events)
+if overall_leads > 0:
+    rm_overall = overall_refs / overall_leads
 
 metric_cols = st.columns(3)
 with metric_cols[0]:
     st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-    st.markdown('<div class="metric-label">Overall Referral Multiplier</div>', unsafe_allow_html=True)
+    st.markdown('<div class="metric-label">Referrals / Qualified</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="metric-value">{format_ratio(rm_overall) if rm_overall is not None else "-"}</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 with metric_cols[1]:
@@ -314,10 +326,19 @@ else:
     display["RM"] = display["RM"].apply(format_ratio)
     display["CPL_net"] = display["CPL_net"].apply(format_currency)
     display["Eff. CPL"] = display["Eff. CPL"].apply(format_currency)
-    display["Conv %"] = display["Conv %"].map(lambda v: f"{v:.1f}%")
+    display["Conv %"] = display["Conv %"].map(lambda v: f"{v:.1f}%" if pd.notna(v) else "—")
     display["Score"] = display["Score"].map(lambda v: f"{v:.1f}")
-    net_gen = (leaderboard["RM"] >= 1.5) & (leaderboard["Lag Score"] >= 60)
+    net_gen = (leaderboard["RM"] >= 0.5) & (leaderboard["Lag Score"] >= 60)
     display["Net Generator"] = net_gen.map(lambda v: "✅" if v else "—")
+
+    display = display.rename(columns={
+        "RM": "Referrals / Qualified",
+        "CPL_net": "CPR (event)",
+        "Eff. CPL": "CPL (lead)",
+        "Conv %": "Qualified / FB",
+    })
+    if "RM_scaled" in display.columns:
+        display = display.drop(columns=["RM_scaled"])
     st.dataframe(display, use_container_width=True, hide_index=True)
 
     selected_payer = st.selectbox(
@@ -367,6 +388,96 @@ else:
         st.plotly_chart(fig, use_container_width=True)
 
 st.markdown('</div>', unsafe_allow_html=True)
+
+# Alignment diagnostics
+with st.expander("Alignment Diagnostics", expanded=False):
+    legacy_df = engine.compute_payer_metrics(metrics_mode="legacy")
+    creative_df = engine.compute_payer_metrics(metrics_mode="creative")
+    if legacy_df.empty or creative_df.empty:
+        st.caption("Diagnostics unavailable (missing payer metrics).")
+    else:
+        def _overall(df_in, mode):
+            leads_total = df_in["leads"].sum()
+            refs_total = df_in["referrals"].sum()
+            spend_total = df_in["spend"].sum()
+            if leads_total <= 0:
+                rm_val = np.nan
+            else:
+                if mode == "creative":
+                    rm_val = refs_total / leads_total
+                else:
+                    rm_val = (leads_total + refs_total) / leads_total
+            return {
+                "Mode": "Creative (qualified/referrals)" if mode == "creative" else "Legacy (direct/referrals)",
+                "Leads": leads_total,
+                "Referrals": refs_total,
+                "Spend": spend_total,
+                "RM": rm_val,
+            }
+
+        overall_df = pd.DataFrame([
+            _overall(legacy_df, "legacy"),
+            _overall(creative_df, "creative"),
+        ])
+        overall_display = overall_df.copy()
+        overall_display["Spend"] = overall_display["Spend"].apply(format_currency)
+        overall_display["RM"] = overall_display["RM"].apply(lambda v: format_ratio(v) if pd.notna(v) else "—")
+        st.markdown("**Overall counts & spend (Legacy vs Creative)**")
+        st.dataframe(overall_display, use_container_width=True, hide_index=True)
+
+        if "spend_source" in creative_df.columns and (creative_df["spend_source"] == "origin_perf").any():
+            st.caption("Creative spend fell back to origin_perf for some payers (MediaCost_referral_event missing).")
+        if "conversion" in creative_df.columns and creative_df["conversion"].notna().sum() == 0:
+            st.caption("Conversion mapping unavailable (media_raw not mappable to campaigns).")
+
+        merged = creative_df.merge(legacy_df, on="payer", suffixes=("_creative", "_legacy"))
+        if merged.empty:
+            st.caption("No overlapping payers to compare.")
+        else:
+            merged["ΔLeads"] = merged["leads_creative"] - merged["leads_legacy"]
+            merged["ΔReferrals"] = merged["referrals_creative"] - merged["referrals_legacy"]
+            merged["ΔSpend"] = merged["spend_creative"] - merged["spend_legacy"]
+            merged["ΔRM"] = merged["rm_creative"] - merged["rm_legacy"]
+            merged["abs_delta"] = merged["ΔLeads"].abs()
+            top = merged.sort_values("abs_delta", ascending=False).head(15).copy()
+
+            display = top.rename(columns={
+                "payer": "Payer",
+                "leads_creative": "Leads (Creative)",
+                "leads_legacy": "Leads (Legacy)",
+                "referrals_creative": "Referrals (Creative)",
+                "referrals_legacy": "Referrals (Legacy)",
+                "spend_creative": "Spend (Creative)",
+                "spend_legacy": "Spend (Legacy)",
+                "rm_creative": "RM (Creative)",
+                "rm_legacy": "RM (Legacy)",
+            })
+            display["Spend (Creative)"] = display["Spend (Creative)"].apply(format_currency)
+            display["Spend (Legacy)"] = display["Spend (Legacy)"].apply(format_currency)
+            display["RM (Creative)"] = display["RM (Creative)"].apply(lambda v: format_ratio(v) if pd.notna(v) else "—")
+            display["RM (Legacy)"] = display["RM (Legacy)"].apply(lambda v: format_ratio(v) if pd.notna(v) else "—")
+            display["ΔSpend"] = display["ΔSpend"].apply(lambda v: format_currency(v))
+            display["ΔRM"] = display["ΔRM"].apply(lambda v: format_ratio(v) if pd.notna(v) else "—")
+            st.markdown("**Top payer deltas (Creative vs Legacy)**")
+            st.dataframe(
+                display[[
+                    "Payer",
+                    "Leads (Creative)",
+                    "Leads (Legacy)",
+                    "ΔLeads",
+                    "Referrals (Creative)",
+                    "Referrals (Legacy)",
+                    "ΔReferrals",
+                    "Spend (Creative)",
+                    "Spend (Legacy)",
+                    "ΔSpend",
+                    "RM (Creative)",
+                    "RM (Legacy)",
+                    "ΔRM",
+                ]],
+                use_container_width=True,
+                hide_index=True
+            )
 
 # ============================================
 # NEW SECTION: Full Funnel Attribution Analysis
@@ -910,6 +1021,10 @@ manifest["parameters"]["prescriptive_rules"] = {
     "spend_spike_multiplier": 1.5,
     "spike_iqr_multiplier": 2.5,
 }
+manifest["parameters"]["metric_mode"] = "creative"
+manifest["parameters"]["spend_source"] = "event_media_cost"
+manifest["parameters"]["rm_definition"] = "referrals_per_qualified"
+manifest["parameters"]["conversion_definition"] = "qualified_per_fb_lead_with_fallback"
 manifest["parameters"]["use_builder_targets"] = use_builder_targets
 manifest["parameters"]["target_leads_per_month"] = None if use_builder_targets else target_leads
 manifest_bytes = json.dumps(manifest, indent=2).encode("utf-8")

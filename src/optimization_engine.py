@@ -28,6 +28,7 @@ from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 import json
 from .attribution_engine import FullFunnelAttributor, PacingValidator, integrate_with_optimization_engine
+from .referral_logic import prepare_referral_ids, count_leads_refs, lead_ref_masks
 
 
 def _find_col(columns, candidates):
@@ -116,9 +117,9 @@ class OptimizationScore:
     Container for optimization score components.
 
     Interpretation:
-    - rm (Referral Multiplier): total leads per direct lead. Higher is better.
+    - rm (Referral Multiplier): referrals per qualified lead (creative) or total/direct (legacy).
     - eff_cpl (Effective CPL): lower is better.
-    - conversion: share of leads that become qualified. Higher is better.
+    - conversion: qualified per FB lead (creative) or qualified per event (legacy).
     - lag_score: higher means faster referral cycle.
     - pacing_score: higher means stable pacing around target.
     - efficiency: higher means lower CPL vs peers.
@@ -275,6 +276,164 @@ class ReferralOptimizationEngine:
         for col in [self.cols["is_origin"], self.cols["is_referral"]]:
             if col and col in self.events.columns:
                 self.events[col] = _normalize_bool(self.events[col])
+
+        # Prepare referral ID fields for Creative-aligned counting
+        (
+            self.events,
+            self._use_referral_ids,
+            self._orig_deal_col,
+            self._deal_id_col,
+        ) = prepare_referral_ids(self.events, inplace=True)
+
+    def _spend_from_origin_perf(self, payer_events: pd.DataFrame) -> float:
+        if self.origin_perf.empty:
+            return 0.0
+        ad_key_col = self.cols.get("ad_key")
+        origin_ad_col = _find_col(self.origin_perf.columns, ['ad_key', 'AdKey', 'campaign_key', 'CampaignKey'])
+        spend_col = _find_col(self.origin_perf.columns, ['monthly spend', 'Monthly Spend', 'S_month', 'Spend', 'spend'])
+        if not ad_key_col or not origin_ad_col or not spend_col:
+            return 0.0
+        ad_keys = payer_events[ad_key_col].dropna().unique()
+        if len(ad_keys) == 0:
+            return 0.0
+        spend_series = pd.to_numeric(
+            self.origin_perf[self.origin_perf[origin_ad_col].isin(ad_keys)][spend_col],
+            errors="coerce"
+        ).fillna(0.0)
+        return float(spend_series.sum())
+
+    def _fb_leads_by_payer(self, attr_col: str) -> Dict[str, float]:
+        if self.media_raw.empty or attr_col not in self.events.columns:
+            return {}
+        event_campaign_col = _find_col(self.events.columns, ["utm_campaign", "utm_key", "ad_key"])
+        media_campaign_col = _find_col(
+            self.media_raw.columns,
+            ["Campaign: Campaign name", "Ad: Ad name", "Ad group: Ad group name"]
+        )
+        conv_col = _find_col(
+            self.media_raw.columns,
+            [
+                "Conversions: All On-Facebook Leads - Total",
+                "Conversions: All On-Facebook Leads - Total (All)",
+                "Conversions: All On-Facebook Leads - Total - All",
+            ],
+        )
+        if not event_campaign_col or not media_campaign_col or not conv_col:
+            return {}
+        media = self.media_raw.copy()
+        media[conv_col] = pd.to_numeric(media[conv_col], errors="coerce").fillna(0.0)
+        media[media_campaign_col] = media[media_campaign_col].astype(str)
+        conv_by_campaign = (
+            media.groupby(media_campaign_col, dropna=False)[conv_col]
+            .sum()
+            .to_dict()
+        )
+        if not conv_by_campaign:
+            return {}
+        payer_map: Dict[str, float] = {}
+        for payer, subset in self.events.groupby(attr_col):
+            if subset.empty:
+                continue
+            campaign_set = set(subset[event_campaign_col].dropna().astype(str))
+            if not campaign_set:
+                continue
+            fb_leads = sum(conv_by_campaign.get(c, 0.0) for c in campaign_set)
+            if fb_leads > 0:
+                payer_map[payer] = float(fb_leads)
+        return payer_map
+
+    def compute_payer_metrics(self, metrics_mode: str = "creative") -> pd.DataFrame:
+        if self.events.empty:
+            return pd.DataFrame()
+        payer_col = self.cols.get("media_payer")
+        attr_col = "_attributed_payer" if "_attributed_payer" in self.events.columns else payer_col
+        if not attr_col:
+            return pd.DataFrame()
+
+        rows = []
+        payers = self.events[attr_col].dropna().unique()
+
+        if metrics_mode == "creative":
+            fb_map = self._fb_leads_by_payer(attr_col)
+            cost_col = "MediaCost_referral_event" if "MediaCost_referral_event" in self.events.columns else None
+            for payer in payers:
+                subset = self.events[self.events[attr_col] == payer]
+                leads, refs, events, orig_set = count_leads_refs(subset)
+                lead_mask, ref_mask = lead_ref_masks(subset, orig_set)
+
+                if cost_col:
+                    spend = float(pd.to_numeric(subset[cost_col], errors="coerce").fillna(0.0).sum())
+                    spend_source = "event_media_cost"
+                else:
+                    spend = float(self._spend_from_origin_perf(subset))
+                    spend_source = "origin_perf"
+
+                eff_cpl = spend / leads if leads > 0 else 0.0
+                cpr = spend / events if events > 0 else 0.0
+                rm = refs / leads if leads > 0 else 0.0
+                fb_leads = fb_map.get(payer)
+                conversion = (leads / fb_leads) if fb_leads and fb_leads > 0 else np.nan
+                rows.append({
+                    "payer": payer,
+                    "leads": int(leads),
+                    "referrals": int(refs),
+                    "events": int(events),
+                    "spend": float(spend),
+                    "rm": float(rm),
+                    "eff_cpl": float(eff_cpl),
+                    "cpr": float(cpr),
+                    "conversion": conversion,
+                    "spend_source": spend_source,
+                    "conversion_source": "media_raw" if pd.notna(conversion) else "unavailable",
+                    "lead_spend": float(pd.to_numeric(subset.loc[lead_mask, cost_col], errors="coerce").fillna(0.0).sum()) if cost_col else 0.0,
+                    "referral_spend": float(pd.to_numeric(subset.loc[ref_mask, cost_col], errors="coerce").fillna(0.0).sum()) if cost_col else 0.0,
+                })
+        else:
+            ad_key_col = self.cols.get("ad_key")
+            origin_ad_col = _find_col(self.origin_perf.columns, ['ad_key', 'AdKey', 'campaign_key', 'CampaignKey'])
+            spend_col = _find_col(self.origin_perf.columns, ['monthly spend', 'Monthly Spend', 'S_month', 'Spend', 'spend'])
+            lead_date_col = self.cols.get("lead_date")
+            ref_date_col = self.cols.get("ref_date")
+            is_origin_col = self.cols.get("is_origin")
+            is_referral_col = self.cols.get("is_referral")
+
+            for payer in payers:
+                payer_events = self.events[self.events[attr_col] == payer]
+                payer_spend = 0.0
+                if (
+                    not self.origin_perf.empty and origin_ad_col and spend_col
+                    and ad_key_col and ad_key_col in payer_events.columns
+                ):
+                    payer_spend = self.origin_perf[self.origin_perf[origin_ad_col].isin(
+                        payer_events[ad_key_col].dropna()
+                    )][spend_col].sum()
+                direct_leads = payer_events[is_origin_col].sum() if is_origin_col and is_origin_col in payer_events.columns else 0
+                referral_leads = (
+                    payer_events[is_referral_col].sum()
+                    if is_referral_col and is_referral_col in payer_events.columns
+                    else max(len(payer_events) - direct_leads, 0)
+                )
+                total_leads = direct_leads + referral_leads
+                qualified_leads = payer_events[ref_date_col].notna().sum() if ref_date_col else 0
+                eff_cpl = payer_spend / qualified_leads if qualified_leads > 0 else 0.0
+                rm = total_leads / direct_leads if direct_leads > 0 else 1.0
+                conversion = (qualified_leads / len(payer_events)) if len(payer_events) > 0 else np.nan
+
+                rows.append({
+                    "payer": payer,
+                    "leads": int(direct_leads),
+                    "referrals": int(referral_leads),
+                    "events": int(total_leads),
+                    "spend": float(payer_spend),
+                    "rm": float(rm),
+                    "eff_cpl": float(eff_cpl),
+                    "cpr": float(payer_spend / total_leads) if total_leads > 0 else 0.0,
+                    "conversion": conversion,
+                    "spend_source": "origin_perf",
+                    "conversion_source": "refdate",
+                })
+
+        return pd.DataFrame(rows)
 
     def _build_attribution(self):
         """
@@ -861,7 +1020,12 @@ class ReferralOptimizationEngine:
             cumulative_target=int(latest['cumulative_target'])
         )
 
-    def compute_optimization_scores(self, lag_metrics: LagMetrics, pacing_metrics: PacingMetrics) -> List[OptimizationScore]:
+    def compute_optimization_scores(
+        self,
+        lag_metrics: LagMetrics,
+        pacing_metrics: PacingMetrics,
+        metrics_mode: str = "creative",
+    ) -> List[OptimizationScore]:
         """
         Compute optimization scores for each media payer.
 
@@ -873,8 +1037,8 @@ class ReferralOptimizationEngine:
             List of OptimizationScore objects, sorted by total_score descending
 
         Scoring components:
-        - Conversion: qualified leads rate.
-        - RM: referral multiplier (total leads / direct leads).
+        - Conversion: qualified/FB leads (creative) or qualified/events (legacy).
+        - RM: referral multiplier (referrals/qualified in creative; total/direct in legacy).
         - Lag score: inverse of referral lag (shorter is better).
         - Pacing: stability around target band.
         - Efficiency: inverse of effective CPL.
@@ -883,7 +1047,7 @@ class ReferralOptimizationEngine:
         - Use the total score to rank payers for action.
         - Use component scores to understand *why* a payer ranks high/low.
         """
-        if self.events.empty or self.origin_perf.empty:
+        if self.events.empty:
             return []
 
         payer_col = self.cols.get("media_payer")
@@ -891,65 +1055,45 @@ class ReferralOptimizationEngine:
         if not attr_col:
             return []
 
-        ad_key_col = self.cols.get("ad_key")
-        origin_ad_col = _find_col(self.origin_perf.columns, ['ad_key', 'AdKey', 'campaign_key', 'CampaignKey'])
-        spend_col = _find_col(self.origin_perf.columns, ['monthly spend', 'Monthly Spend', 'S_month', 'Spend', 'spend'])
+        metrics_df = self.compute_payer_metrics(metrics_mode=metrics_mode)
+        if metrics_df.empty:
+            return []
+        metrics_df = metrics_df.set_index("payer")
+
         lead_date_col = self.cols.get("lead_date")
-        ref_date_col = self.cols.get("ref_date")
-        is_origin_col = self.cols.get("is_origin")
-        is_referral_col = self.cols.get("is_referral")
         dest_col = self.cols.get("dest_builder")
         parent_col = self.cols.get("parent_id")
         lead_id_col = self.cols.get("lead_id")
 
         # Group by media payer
         payers = self.events[attr_col].dropna().unique()
+        payer_groups = dict(tuple(self.events.groupby(attr_col)))
 
         # Global lag scaling
         global_ref_lag = lag_metrics.L_ref if lag_metrics else 0
         ref_lag_p90 = max(global_ref_lag * 2, 1)
 
         # Precompute payer stats for consistent scaling
-        payer_stats = {}
-        eff_values = []
-        for payer in payers:
-            payer_events = self.events[self.events[attr_col] == payer]
-            payer_spend = 0.0
-            if origin_ad_col and spend_col and ad_key_col and ad_key_col in payer_events.columns:
-                payer_spend = self.origin_perf[self.origin_perf[origin_ad_col].isin(
-                    payer_events[ad_key_col].dropna()
-                )][spend_col].sum()
-            direct_leads = payer_events[is_origin_col].sum() if is_origin_col and is_origin_col in payer_events.columns else 0
-            referral_leads = payer_events[is_referral_col].sum() if is_referral_col and is_referral_col in payer_events.columns else max(len(payer_events) - direct_leads, 0)
-            qualified_leads = payer_events[ref_date_col].notna().sum() if ref_date_col else 0
-            eff_cpl = payer_spend / qualified_leads if qualified_leads > 0 else 0.0
-            eff_values.append(eff_cpl if eff_cpl > 0 else np.nan)
-            payer_stats[payer] = {
-                "events": payer_events,
-                "spend": payer_spend,
-                "direct_leads": direct_leads,
-                "referral_leads": referral_leads,
-                "qualified_leads": qualified_leads,
-                "eff_cpl": eff_cpl,
-            }
-
-        eff_series = pd.Series([v for v in eff_values if not np.isnan(v)])
+        eff_series = metrics_df["eff_cpl"].replace(0, np.nan).dropna()
         eff_p90 = eff_series.quantile(0.9) if not eff_series.empty else 1.0
 
         scores = []
         for payer in payers:
-            payer_events = payer_stats[payer]["events"]
-            payer_spend = payer_stats[payer]["spend"]
-            direct_leads = payer_stats[payer]["direct_leads"]
-            referral_leads = payer_stats[payer]["referral_leads"]
-            qualified_leads = payer_stats[payer]["qualified_leads"]
-            eff_cpl = payer_stats[payer]["eff_cpl"]
-
-            total_leads = direct_leads + referral_leads
-            rm = total_leads / direct_leads if direct_leads > 0 else 1.0
-
-            # Component scores (0-100 scale)
-            conversion = min(100, (qualified_leads / len(payer_events)) * 100) if len(payer_events) > 0 else 0
+            if payer not in metrics_df.index:
+                continue
+            payer_events = payer_groups.get(payer, pd.DataFrame())
+            metrics_row = metrics_df.loc[payer]
+            payer_spend = float(metrics_row["spend"])
+            direct_leads = int(metrics_row["leads"])
+            referral_leads = int(metrics_row["referrals"])
+            rm = float(metrics_row["rm"])
+            eff_cpl = float(metrics_row["eff_cpl"])
+            conversion_rate = metrics_row.get("conversion", np.nan)
+            conversion = (
+                float(conversion_rate) * 100
+                if pd.notna(conversion_rate)
+                else np.nan
+            )
 
             # Lag score (inverse of L_ref, normalized)
             payer_lag = None
@@ -986,14 +1130,30 @@ class ReferralOptimizationEngine:
             efficiency = _score_inverse(eff_cpl, eff_p90)
 
             # Weighted total score
-            weights = [0.15, 0.35, 0.2, 0.1, 0.2]  # Conv, RM, Lag, Pace, Eff
-            total_score = (
-                weights[0] * conversion +
-                weights[1] * min(100, (rm / 1.5) * 100) +  # Scale RM to 0-100
-                weights[2] * lag_score +
-                weights[3] * pacing_score +
-                weights[4] * efficiency
-            )
+            weights = {
+                "conversion": 0.15,
+                "rm": 0.35,
+                "lag": 0.2,
+                "pacing": 0.1,
+                "efficiency": 0.2,
+            }
+            rm_scale = 0.5 if metrics_mode == "creative" else 1.5
+            rm_score = min(100.0, (rm / rm_scale) * 100) if rm_scale > 0 else 0.0
+
+            total_score = 0.0
+            weight_sum = 0.0
+            if pd.notna(conversion):
+                total_score += weights["conversion"] * min(100.0, max(conversion, 0.0))
+                weight_sum += weights["conversion"]
+            total_score += weights["rm"] * rm_score
+            weight_sum += weights["rm"]
+            total_score += weights["lag"] * lag_score
+            weight_sum += weights["lag"]
+            total_score += weights["pacing"] * pacing_score
+            weight_sum += weights["pacing"]
+            total_score += weights["efficiency"] * efficiency
+            weight_sum += weights["efficiency"]
+            total_score = (total_score / weight_sum) if weight_sum > 0 else 0.0
 
             scores.append(OptimizationScore(
                 payer=payer,
