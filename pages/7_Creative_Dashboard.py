@@ -1701,6 +1701,10 @@ def main():
                                 p50_day = int(np.searchsorted(cum, 0.5))
                                 p80_day = int(np.searchsorted(cum, 0.8))
                                 effect_per_1k = total_response * 1000
+                                if signal_choice == "FB Leads":
+                                    effect_label = "Response / 1k FB Leads"
+                                else:
+                                    effect_label = "Response / $1k"
 
                                 kpi_left, kpi_right = st.columns([1.3, 1])
                                 with kpi_left:
@@ -1714,7 +1718,7 @@ def main():
                                 with kpi_right:
                                     st.markdown(f"""
                                     <div class="kpi-row">
-                                        <div class="kpi"><div class="kpi-label">Response / $1k</div><div class="kpi-value">{effect_per_1k:.2f} refs</div></div>
+                                        <div class="kpi"><div class="kpi-label">{effect_label}</div><div class="kpi-value">{effect_per_1k:.2f} refs</div></div>
                                         <div class="kpi"><div class="kpi-label">Model R²</div><div class="kpi-value">{_fmt(r2, fmt="{:.2f}")}</div></div>
                                     </div>
                                     """, unsafe_allow_html=True)
@@ -1758,6 +1762,115 @@ def main():
                             )
                             st.plotly_chart(curve_fig, use_container_width=True, config={"displayModeBar": False})
 
+                            st.markdown("**Spend size → conversion efficiency**")
+                            st.markdown("""
+                            <div class="explainer">
+                                <div class="explainer-title">How to read this</div>
+                                <div class="explainer-text">
+                                    This checks whether higher daily spend tends to deliver stronger or weaker
+                                    conversion efficiency after accounting for the lag window.
+                                    If the correlation is <b>negative</b>, conversion efficiency drops as spend rises
+                                    (diminishing returns). If it's <b>positive</b>, higher spend tends to perform better.
+                                </div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                            horizon_days = st.slider(
+                                "Planning horizon (days)",
+                                7,
+                                90,
+                                30,
+                                step=1,
+                                key="budget_response_horizon_days"
+                            )
+
+                            lag_align_days = int(p50_day) if total_response > 0 else 0
+                            ref_aligned = ref_daily.shift(-lag_align_days)
+                            spend_series = media_daily["Spend"]
+                            if conv_col_media and "FB_Leads" in media_daily.columns:
+                                denom_series = media_daily["FB_Leads"].replace(0, np.nan)
+                                conv_rate = ref_aligned / denom_series
+                                conv_label = "Referrals per FB Lead (lag-aligned)"
+                                conv_unit_note = "rate"
+                            else:
+                                denom_series = spend_series.replace(0, np.nan)
+                                conv_rate = (ref_aligned / denom_series) * 1000
+                                conv_label = "Referrals per $1k (lag-aligned)"
+                                conv_unit_note = "$1k"
+
+                            analysis_df = pd.DataFrame({
+                                "Spend": spend_series,
+                                "ConvRate": conv_rate
+                            }).replace([np.inf, -np.inf], np.nan).dropna()
+                            analysis_df = analysis_df[analysis_df["Spend"] > 0]
+
+                            if len(analysis_df) < 10:
+                                st.caption("Not enough data points to analyze spend size vs conversion efficiency.")
+                            else:
+                                corr = analysis_df["Spend"].corr(analysis_df["ConvRate"], method="spearman")
+                                st.caption(
+                                    f"Spend vs conversion efficiency correlation (Spearman): {corr:.2f}. "
+                                    f"{'Negative' if corr < -0.1 else 'Positive' if corr > 0.1 else 'Weak'} relationship."
+                                )
+
+                                bin_count = min(4, analysis_df["Spend"].nunique())
+                                bin_stats = pd.DataFrame()
+                                if bin_count >= 2:
+                                    analysis_df["SpendBin"] = pd.qcut(
+                                        analysis_df["Spend"],
+                                        q=bin_count,
+                                        duplicates="drop"
+                                    )
+                                    bin_stats = (
+                                        analysis_df.groupby("SpendBin")
+                                        .agg(
+                                            days=("Spend", "size"),
+                                            spend_median=("Spend", "median"),
+                                            rate_median=("ConvRate", "median")
+                                        )
+                                        .reset_index()
+                                    )
+
+                                if not bin_stats.empty:
+                                    eligible = bin_stats[bin_stats["days"] >= 5]
+                                    if not eligible.empty:
+                                        best = eligible.sort_values("rate_median", ascending=False).iloc[0]
+                                        spend_low = float(best["SpendBin"].left)
+                                        spend_high = float(best["SpendBin"].right)
+                                        recommended_low = spend_low * horizon_days
+                                        recommended_high = spend_high * horizon_days
+                                        st.caption(
+                                            f"Suggested daily spend band (best median conversion efficiency): "
+                                            f"${_fmt(spend_low)}–${_fmt(spend_high)} per day. "
+                                            f"Median efficiency: {best['rate_median']:.2f} referrals per {conv_unit_note}. "
+                                            f"Recommended total budget for {horizon_days} days: "
+                                            f"${_fmt(recommended_low)}–${_fmt(recommended_high)}."
+                                        )
+
+                                spend_fig = go.Figure()
+                                spend_fig.add_trace(go.Scatter(
+                                    x=analysis_df["Spend"],
+                                    y=analysis_df["ConvRate"],
+                                    mode="markers",
+                                    name="Daily points",
+                                    marker=dict(color="#94a3b8", size=6, opacity=0.6)
+                                ))
+                                if not bin_stats.empty:
+                                    spend_fig.add_trace(go.Scatter(
+                                        x=bin_stats["spend_median"],
+                                        y=bin_stats["rate_median"],
+                                        mode="lines+markers",
+                                        name="Median by spend band",
+                                        line=dict(color="#6366f1")
+                                    ))
+                                spend_fig.update_layout(
+                                    height=260,
+                                    margin=dict(l=0, r=0, t=30, b=0),
+                                    xaxis_title="Daily spend",
+                                    yaxis_title=conv_label,
+                                    title="Spend size vs conversion efficiency"
+                                )
+                                st.plotly_chart(spend_fig, use_container_width=True, config={"displayModeBar": False})
+
                             spend_daily = media_daily["Spend"].copy()
                             total_spend = float(spend_daily.sum())
                             if total_spend <= 0:
@@ -1783,72 +1896,91 @@ def main():
                                         st.caption("Budget not fully deployed within the selected date range.")
                                     else:
                                         budget_hit_date = hit_idx.index[0]
-                                        expected_by_lag = budget * response_pos
-                                        impact_dates = [budget_hit_date + pd.Timedelta(days=int(l)) for l in range(len(expected_by_lag))]
-                                        impact_df = pd.DataFrame({
-                                            "Date": impact_dates,
-                                            "Expected_Referrals": expected_by_lag
-                                        })
-                                        impact_df["Cumulative"] = impact_df["Expected_Referrals"].cumsum()
-                                        total_expected = impact_df["Expected_Referrals"].sum()
-                                        if total_expected > 0:
-                                            cum_ratio = impact_df["Cumulative"] / total_expected
-                                            p50_date = impact_df.loc[cum_ratio >= 0.5, "Date"].iloc[0]
-                                            p80_date = impact_df.loc[cum_ratio >= 0.8, "Date"].iloc[0]
-                                            st.caption(
-                                                f"Expected impact window: 50% by {p50_date.date()} "
-                                                f"(~{(p50_date - budget_hit_date).days} days), "
-                                                f"80% by {p80_date.date()} (~{(p80_date - budget_hit_date).days} days)."
-                                            )
+                                        expected_by_lag = None
+                                        avg_cpl = None
+                                        if signal_choice == "FB Leads":
+                                            fb_total = media_daily["FB_Leads"].sum() if "FB_Leads" in media_daily.columns else 0.0
+                                            avg_cpl = (total_spend / fb_total) if fb_total > 0 else np.nan
+                                            if np.isnan(avg_cpl) or avg_cpl <= 0:
+                                                st.caption("Cannot translate budget to FB leads (missing or zero FB leads).")
+                                            else:
+                                                signal_units = budget / avg_cpl
+                                                expected_by_lag = signal_units * response_pos
+                                        else:
+                                            expected_by_lag = budget * response_pos
 
-                                        impact_fig = go.Figure()
-                                        impact_fig.add_trace(go.Bar(
-                                            x=impact_df["Date"],
-                                            y=impact_df["Expected_Referrals"],
-                                            name="Expected referrals",
-                                            marker_color="#14b8a6"
-                                        ))
-                                        impact_fig.add_trace(go.Scatter(
-                                            x=impact_df["Date"],
-                                            y=impact_df["Cumulative"],
-                                            name="Cumulative",
-                                            mode="lines",
-                                            yaxis="y2",
-                                            line=dict(color="#6366f1")
-                                        ))
-                                        impact_fig.add_shape(
-                                            type="line",
-                                            x0=budget_hit_date,
-                                            x1=budget_hit_date,
-                                            y0=0,
-                                            y1=1,
-                                            xref="x",
-                                            yref="paper",
-                                            line=dict(color="#f59e0b", dash="dash")
-                                        )
-                                        impact_fig.add_annotation(
-                                            x=budget_hit_date,
-                                            y=1,
-                                            xref="x",
-                                            yref="paper",
-                                            text="Budget deployed",
-                                            showarrow=False,
-                                            yanchor="bottom",
-                                            font=dict(color="#f59e0b")
-                                        )
-                                        impact_fig.update_layout(
-                                            height=280,
-                                            margin=dict(l=0, r=0, t=30, b=0),
-                                            yaxis_title="Expected referrals",
-                                            yaxis2=dict(
-                                                overlaying="y",
-                                                side="right",
-                                                title="Cumulative expected referrals",
-                                                rangemode="tozero"
-                                            ),
-                                            title="Budget deployment vs expected referral impact"
-                                        )
-                                        st.plotly_chart(impact_fig, use_container_width=True, config={"displayModeBar": False})
+                                        if expected_by_lag is None:
+                                            st.caption("Unable to project referrals with the current inputs.")
+                                        else:
+                                            impact_dates = [budget_hit_date + pd.Timedelta(days=int(l)) for l in range(len(expected_by_lag))]
+                                            impact_df = pd.DataFrame({
+                                                "Date": impact_dates,
+                                                "Expected_Referrals": expected_by_lag
+                                            })
+                                            impact_df["Cumulative"] = impact_df["Expected_Referrals"].cumsum()
+                                            total_expected = impact_df["Expected_Referrals"].sum()
+                                            if total_expected > 0:
+                                                cum_ratio = impact_df["Cumulative"] / total_expected
+                                                p50_date = impact_df.loc[cum_ratio >= 0.5, "Date"].iloc[0]
+                                                p80_date = impact_df.loc[cum_ratio >= 0.8, "Date"].iloc[0]
+                                                cpl_note = ""
+                                                if signal_choice == "FB Leads" and avg_cpl:
+                                                    cpl_note = f" (assumes avg CPL ${avg_cpl:.0f})"
+                                                st.caption(
+                                                    f"Projected referrals: {total_expected:.1f}{cpl_note}. "
+                                                    f"Expected impact window: 50% by {p50_date.date()} "
+                                                    f"(~{(p50_date - budget_hit_date).days} days), "
+                                                    f"80% by {p80_date.date()} (~{(p80_date - budget_hit_date).days} days)."
+                                                )
+
+                                            impact_fig = go.Figure()
+                                            impact_fig.add_trace(go.Bar(
+                                                x=impact_df["Date"],
+                                                y=impact_df["Expected_Referrals"],
+                                                name="Expected referrals",
+                                                marker_color="#14b8a6"
+                                            ))
+                                            impact_fig.add_trace(go.Scatter(
+                                                x=impact_df["Date"],
+                                                y=impact_df["Cumulative"],
+                                                name="Cumulative",
+                                                mode="lines",
+                                                yaxis="y2",
+                                                line=dict(color="#6366f1")
+                                            ))
+                                            impact_fig.add_shape(
+                                                type="line",
+                                                x0=budget_hit_date,
+                                                x1=budget_hit_date,
+                                                y0=0,
+                                                y1=1,
+                                                xref="x",
+                                                yref="paper",
+                                                line=dict(color="#f59e0b", dash="dash")
+                                            )
+                                            impact_fig.add_annotation(
+                                                x=budget_hit_date,
+                                                y=1,
+                                                xref="x",
+                                                yref="paper",
+                                                text="Budget deployed",
+                                                showarrow=False,
+                                                yanchor="bottom",
+                                                font=dict(color="#f59e0b")
+                                            )
+                                            impact_fig.update_layout(
+                                                height=280,
+                                                margin=dict(l=0, r=0, t=30, b=0),
+                                                yaxis_title="Expected referrals",
+                                                yaxis2=dict(
+                                                    overlaying="y",
+                                                    side="right",
+                                                    title="Cumulative expected referrals",
+                                                    rangemode="tozero"
+                                                ),
+                                                title="Budget deployment vs expected referral impact"
+                                            )
+                                            st.plotly_chart(impact_fig, use_container_width=True, config={"displayModeBar": False})
 
 if __name__ == "__main__":
     main()
