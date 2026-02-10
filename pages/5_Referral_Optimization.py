@@ -465,8 +465,9 @@ with st.sidebar:
     cmd_live_only = st.checkbox(
         "Live Jobs Only",
         value=True,
-        help="Exclude completed/cancelled/paused jobs (uses STATUS_final column)",
+        help="Always on: only optimize jobs where STATUS is Live.",
         key="cmd_live_only",
+        disabled=True,
     )
     all_sources = sorted(
         events["MediaPayer_BuilderRegionKey"].dropna().unique().tolist()
@@ -489,16 +490,61 @@ _cmd_engine = CampaignCommandEngine(
 _cmd_plan = _cmd_engine.generate_plan()
 
 if not _cmd_plan.summary or "error" in _cmd_plan.summary:
-    st.caption("No campaign targets found. Ensure LeadTarget_from_job and Dest_BuilderRegionKey exist in data.")
+    error_msg = "No campaign targets found. Ensure LeadTarget_from_job and Dest_BuilderRegionKey exist in data."
+    if _cmd_plan.summary and _cmd_plan.summary.get("error"):
+        error_msg = _cmd_plan.summary.get("error")
+    st.warning(error_msg)
+    diagnostics = _cmd_plan.summary.get("diagnostics") if _cmd_plan.summary else None
+    if diagnostics:
+        st.markdown("**Diagnostics**")
+        diag_df = pd.DataFrame([
+            {"Metric": k, "Value": v}
+            for k, v in diagnostics.items()
+            if k not in ("status_top", "filter_stats")
+        ])
+        if not diag_df.empty:
+            st.dataframe(diag_df, use_container_width=True, hide_index=True)
+        status_top = diagnostics.get("status_top")
+        if not status_top:
+            status_top = diagnostics.get("filter_stats", {}).get("status_top")
+        if status_top:
+            st.markdown("**Top STATUS values (pre-filter)**")
+            st.dataframe(
+                pd.DataFrame([{"STATUS": k, "Count": v} for k, v in status_top.items()]),
+                use_container_width=True,
+                hide_index=True,
+            )
+        filter_stats = diagnostics.get("filter_stats")
+        if filter_stats:
+            st.markdown("**Filter Stats**")
+            st.dataframe(
+                pd.DataFrame([{"Metric": k, "Value": v} for k, v in filter_stats.items()]),
+                use_container_width=True,
+                hide_index=True,
+            )
+    st.stop()
 else:
     filter_stats = _cmd_plan.summary.get("filter_stats")
     if filter_stats:
-        st.caption(
-            f"Filtered to Live jobs: {filter_stats['post_filter']:,} events "
+        status_col = filter_stats.get("status_col")
+        end_col = filter_stats.get("end_col")
+        pre_jobs = filter_stats.get("pre_jobs")
+        post_jobs = filter_stats.get("post_jobs")
+        removed_jobs = filter_stats.get("removed_jobs")
+        status_label = status_col if status_col else "missing"
+        end_label = end_col if end_col else "missing"
+        end_used = filter_stats.get("end_filter_used")
+        caption = (
+            f"Filtered to Live jobs (status: {status_label}"
+            f"{', end date: ' + end_label if end_used else ''}): "
+            f"{filter_stats['post_filter']:,} events "
             f"({filter_stats['removed']:,} excluded from {filter_stats['pre_filter']:,} total)"
         )
+        if pre_jobs is not None and post_jobs is not None and removed_jobs is not None:
+            caption += f"; {post_jobs:,} jobs ({removed_jobs:,} excluded from {pre_jobs:,})"
+        st.caption(caption)
     elif cmd_live_only:
-        st.caption("STATUS_final column not found — showing all jobs. Upload data with STATUS_final to enable filtering.")
+        st.caption("STATUS/STATUS_final columns not found — showing all jobs. Upload data with STATUS to enable filtering.")
 
     st.markdown(
         """
@@ -612,9 +658,11 @@ else:
         if not timing_window_df.empty:
             timing_window_df["Effective Spend Window"] = (timing_window_df["days_remaining"] - global_lag).clip(lower=0)
             timing_window_df["Last Spend Date"] = timing_window_df["job_end"] - pd.Timedelta(days=global_lag)
+            campaign_display_col = "job_label" if "job_label" in timing_window_df.columns else "campaign"
+            timing_window_df["campaign_display"] = timing_window_df[campaign_display_col]
             timing_window_df = timing_window_df.sort_values("Effective Spend Window")
             timing_window_df = timing_window_df.rename(columns={
-                "campaign": "Campaign",
+                "campaign_display": "Campaign",
                 "shortfall": "Shortfall",
                 "pace_status": "Pace Status",
                 "days_remaining": "Days Left",
@@ -645,10 +693,16 @@ else:
         if status_df.empty:
             st.caption("No campaign status available.")
         else:
+            campaign_display_col = "job_label" if "job_label" in status_df.columns else "campaign"
+            status_df["campaign_display"] = status_df[campaign_display_col]
             lag_series = status_df["lag_days"] if "lag_days" in status_df.columns else np.nan
             effective_series = status_df["effective_days_remaining"] if "effective_days_remaining" in status_df.columns else np.nan
-            triage_df = pd.DataFrame({
-                "Job": status_df["campaign"],
+            triage_payload = {
+                "Job": status_df["campaign_display"],
+            }
+            if "job_id" in status_df.columns:
+                triage_payload["Job ID"] = status_df["job_id"]
+            triage_payload.update({
                 "Target": status_df["lead_target"],
                 "Actual": status_df["leads_actual"],
                 "Proj. Shortfall": status_df["shortfall"],
@@ -661,6 +715,7 @@ else:
                 "Days Left": status_df["days_remaining"],
                 "Urgency": status_df["urgency_score"].map(lambda v: f"{v:.1f}"),
             })
+            triage_df = pd.DataFrame(triage_payload)
             st.dataframe(triage_df, use_container_width=True, hide_index=True)
             st.caption("Pace ratio below 1.0 means current pace is behind required pace.")
 
@@ -670,14 +725,14 @@ else:
             else:
                 fig = go.Figure()
                 fig.add_trace(go.Bar(
-                    y=top_shortfall["campaign"],
+                    y=top_shortfall["campaign_display"],
                     x=top_shortfall["required_pace"],
                     orientation="h",
                     name="Required Pace",
                     marker_color="#E2E8F0",
                 ))
                 fig.add_trace(go.Bar(
-                    y=top_shortfall["campaign"],
+                    y=top_shortfall["campaign_display"],
                     x=top_shortfall["actual_pace"],
                     orientation="h",
                     name="Actual Pace",

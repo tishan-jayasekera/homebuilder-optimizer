@@ -1429,26 +1429,48 @@ def main():
                         st.caption("Not enough variation to compute lag correlation.")
 
     st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
-    st.markdown("**Budget deployment → referral peak**")
+    st.markdown("**Budget deployment → referral response window**")
     st.markdown("""
     <div class="explainer">
         <div class="explainer-title">What this shows</div>
         <div class="explainer-text">
-            Set a budget, then see when that budget is fully deployed and how many days later referrals peak.
-            This gives a practical “time‑to‑impact” window for a spend decision.
-            The budget slider defaults to <b>50% of the observed spend</b> in the selected date range
-            (min $50 step, max = total observed spend), so it is grounded in your empirical spend history.
+            This section estimates <b>how long it takes spend to turn into referrals</b> and
+            <b>how the impact is spread over time</b>. It uses a lagged response model so we don’t
+            overreact to single-day spikes.
+            <br/><br/>
+            <b>Why this is more reliable:</b> Instead of picking one “peak” day, it estimates a full
+            impact curve and reports when <b>50%</b> (P50) and <b>80%</b> (P80) of the impact arrives.
+            This keeps the answer stable even when daily referrals are noisy.
+            <br/><br/>
+            <b>How to read the outputs:</b>
+            <br/>• <b>Peak Lag</b> = the day with the strongest response.
+            <br/>• <b>P50 Impact</b> = half the impact is in by this day.
+            <br/>• <b>P80 Impact</b> = most of the impact is in by this day.
+            <br/>• <b>Response / $1k</b> = expected referrals per $1,000 of signal (use for comparisons, not absolute truth).
+            <br/>• <b>Model R²</b> = how well the model explains the data (higher is better).
+            <br/><br/>
+            <b>Important:</b> If the model says “no positive response,” it means the data in this window
+            isn’t strong enough to draw a timing conclusion. In that case, widen the date range or avoid
+            making timing decisions from this view.
         </div>
     </div>
     """, unsafe_allow_html=True)
     if media_raw is None:
-        st.caption("Upload media_raw_base_phase0 to enable budget analysis.")
+        st.caption("Upload media_raw_base_phase0 to enable response modeling.")
     else:
         media = media_raw.copy()
         report_col = _find_col(media.columns, ["Report: Date", "Report Date", "Report:Date", "Date"])
         spend_col_media = _find_col(
             media.columns,
             ["Cost: Amount spend", "Cost: Amount spent", "Cost: Amount Spent", "Amount Spent", "Spend"]
+        )
+        conv_col_media = _find_col(
+            media.columns,
+            [
+                "Conversions: All On-Facebook Leads - Total",
+                "Conversions: All On-Facebook Leads - Total (All)",
+                "Conversions: All On-Facebook Leads - Total - All"
+            ]
         )
         camp_col_media = _find_col(media.columns, ["Campaign: Campaign name"])
         ad_group_col_media = _find_col(media.columns, ["Ad group: Ad group name"])
@@ -1460,7 +1482,7 @@ def main():
             "Ad group: Ad group name": ad_group_col_media
         }.items() if v is None]
         if missing_cols:
-            st.caption("Budget analysis missing columns: " + ", ".join(missing_cols))
+            st.caption("Response modeling missing columns: " + ", ".join(missing_cols))
         else:
             media[report_col] = pd.to_datetime(media[report_col], errors="coerce")
             media = media.dropna(subset=[report_col])
@@ -1475,166 +1497,358 @@ def main():
                 st.caption("No media rows match the selected campaign/ad set in the chosen date range.")
             else:
                 media[spend_col_media] = pd.to_numeric(media[spend_col_media], errors="coerce").fillna(0.0)
+                if conv_col_media:
+                    media[conv_col_media] = pd.to_numeric(media[conv_col_media], errors="coerce").fillna(0.0)
+
                 date_index = pd.date_range(start=start_d, end=end_d, freq="D")
-                spend_daily = (
-                    media.assign(date=media[report_col].dt.normalize())
-                    .groupby("date", as_index=False)[spend_col_media]
-                    .sum()
-                    .rename(columns={spend_col_media: "Spend"})
-                    .set_index("date")
-                    .reindex(date_index, fill_value=0.0)
-                )
-                spend_daily["Cumulative_Spend"] = spend_daily["Spend"].cumsum()
-                total_spend = float(spend_daily["Cumulative_Spend"].iloc[-1])
-                if total_spend <= 0:
-                    st.caption("No spend recorded for this selection.")
+                if len(date_index) < 14:
+                    st.caption("Need at least 14 days of data to estimate a lagged response.")
                 else:
-                    step = max(50.0, total_spend / 200)
-                    budget = st.slider(
-                        "Budget to evaluate",
-                        0.0,
-                        float(total_spend),
-                        float(total_spend * 0.5),
-                        step=float(step),
-                        key="budget_peak_slider"
+                    agg_map = {"Spend": (spend_col_media, "sum")}
+                    if conv_col_media:
+                        agg_map["FB_Leads"] = (conv_col_media, "sum")
+                    media_daily = (
+                        media.assign(date=media[report_col].dt.normalize())
+                        .groupby("date", as_index=False)
+                        .agg(**agg_map)
+                        .set_index("date")
+                        .reindex(date_index, fill_value=0.0)
                     )
-                    budget_hit_date = None
-                    if budget > 0:
-                        hit_idx = spend_daily[spend_daily["Cumulative_Spend"] >= budget]
-                        if not hit_idx.empty:
-                            budget_hit_date = hit_idx.index[0]
-                    if budget_hit_date is None:
-                        st.caption("Budget not fully deployed within the selected date range.")
+
+                    ref_df = c_df[c_df[ref_flag_col] == True].copy()
+                    ref_date_col = "RefDate" if "RefDate" in ref_df.columns else "event_date"
+                    ref_df["_ref_date"] = pd.to_datetime(ref_df[ref_date_col], errors="coerce")
+                    ref_df = ref_df.dropna(subset=["_ref_date"])
+                    ref_df = ref_df[
+                        (ref_df["_ref_date"] >= pd.Timestamp(start_d)) &
+                        (ref_df["_ref_date"] <= pd.Timestamp(end_d))
+                    ]
+
+                    if ref_df.empty:
+                        st.caption("No referrals in the selected date range.")
                     else:
-                        ref_df = c_df[c_df[ref_flag_col] == True].copy()
-                        ref_date_col = "RefDate" if "RefDate" in ref_df.columns else "event_date"
-                        ref_df["_ref_date"] = pd.to_datetime(ref_df[ref_date_col], errors="coerce")
-                        ref_df = ref_df.dropna(subset=["_ref_date"])
-                        ref_df = ref_df[
-                            (ref_df["_ref_date"] >= pd.Timestamp(start_d)) &
-                            (ref_df["_ref_date"] <= pd.Timestamp(end_d))
-                        ]
-                        if ref_df.empty:
-                            st.caption("No referrals in the selected date range.")
-                        else:
-                            if use_unique_ids and "_deal_id" in ref_df.columns:
-                                ref_daily = (
-                                    ref_df.groupby(ref_df["_ref_date"].dt.normalize())["_deal_id"]
-                                    .nunique()
-                                    .reindex(date_index, fill_value=0)
-                                )
-                            elif lead_id_col and lead_id_col in ref_df.columns:
-                                ref_daily = (
-                                    ref_df.groupby(ref_df["_ref_date"].dt.normalize())[lead_id_col]
-                                    .nunique()
-                                    .reindex(date_index, fill_value=0)
-                                )
-                            else:
-                                ref_daily = (
-                                    ref_df.groupby(ref_df["_ref_date"].dt.normalize())
-                                    .size()
-                                    .reindex(date_index, fill_value=0)
-                                )
-
-                            smooth_window = st.selectbox(
-                                "Referral smoothing (days)",
-                                [1, 3, 7],
-                                index=1,
-                                key="budget_peak_smooth"
+                        if use_unique_ids and "_deal_id" in ref_df.columns:
+                            ref_daily = (
+                                ref_df.groupby(ref_df["_ref_date"].dt.normalize())["_deal_id"]
+                                .nunique()
+                                .reindex(date_index, fill_value=0)
                             )
-                            if smooth_window > 1:
-                                ref_daily = ref_daily.rolling(smooth_window, min_periods=1).mean()
+                        elif lead_id_col and lead_id_col in ref_df.columns:
+                            ref_daily = (
+                                ref_df.groupby(ref_df["_ref_date"].dt.normalize())[lead_id_col]
+                                .nunique()
+                                .reindex(date_index, fill_value=0)
+                            )
+                        else:
+                            ref_daily = (
+                                ref_df.groupby(ref_df["_ref_date"].dt.normalize())
+                                .size()
+                                .reindex(date_index, fill_value=0)
+                            )
 
-                            post_budget = ref_daily.loc[budget_hit_date:]
-                            if post_budget.empty or post_budget.sum() == 0:
-                                st.caption("No referrals after budget was fully deployed.")
+                        signal_options = ["Spend"]
+                        if conv_col_media:
+                            signal_options.append("FB Leads")
+                        signal_choice = st.radio(
+                            "Media signal",
+                            signal_options,
+                            horizontal=True,
+                            key="budget_response_signal"
+                        )
+
+                        lag_max = min(90, max(7, len(date_index) - 7))
+                        lag_default = min(45, lag_max)
+                        max_lag = st.slider(
+                            "Max lag (days)",
+                            7,
+                            lag_max,
+                            lag_default,
+                            step=1,
+                            key="budget_response_max_lag"
+                        )
+                        ridge_lambda = st.slider(
+                            "Ridge penalty (stability)",
+                            0.0,
+                            200.0,
+                            20.0,
+                            step=5.0,
+                            key="budget_response_ridge"
+                        )
+                        include_dow = st.checkbox(
+                            "Control for day-of-week",
+                            value=True,
+                            key="budget_response_dow"
+                        )
+                        include_trend = st.checkbox(
+                            "Control for trend",
+                            value=True,
+                            key="budget_response_trend"
+                        )
+                        show_boot = st.checkbox(
+                            "Show uncertainty band (bootstrapped)",
+                            value=True,
+                            key="budget_response_boot"
+                        )
+                        n_boot = 0
+                        if show_boot:
+                            n_boot = st.slider(
+                                "Bootstrap draws",
+                                50,
+                                300,
+                                150,
+                                step=50,
+                                key="budget_response_boot_n"
+                            )
+
+                        x_series = media_daily["FB_Leads"] if signal_choice == "FB Leads" else media_daily["Spend"]
+                        y_series = ref_daily.astype(float)
+                        if x_series.sum() <= 0:
+                            st.caption("No media signal available to estimate a response curve.")
+                        else:
+                            def _build_lag_matrix(x_vals: np.ndarray, max_lag_days: int) -> np.ndarray:
+                                t_len = len(x_vals)
+                                X = np.zeros((t_len, max_lag_days + 1), dtype=float)
+                                for lag in range(max_lag_days + 1):
+                                    if lag == 0:
+                                        X[:, lag] = x_vals
+                                    else:
+                                        X[lag:, lag] = x_vals[:-lag]
+                                return X
+
+                            def _fit_ridge_response(
+                                x_vals: np.ndarray,
+                                y_vals: np.ndarray,
+                                max_lag_days: int,
+                                ridge_penalty: float,
+                                dow,
+                                add_trend: bool
+                            ):
+                                X_lag = _build_lag_matrix(x_vals, max_lag_days)
+                                x_mean = X_lag.mean(axis=0)
+                                x_std = X_lag.std(axis=0)
+                                x_std[x_std == 0] = 1.0
+                                Xs = (X_lag - x_mean) / x_std
+
+                                cols = [np.ones(len(y_vals))]
+                                if add_trend:
+                                    cols.append(np.linspace(0, 1, len(y_vals)))
+                                if dow is not None:
+                                    dow_dummies = pd.get_dummies(dow, drop_first=True).values
+                                    cols.append(dow_dummies)
+                                cols.append(Xs)
+                                X_design = np.column_stack(cols)
+
+                                n_pen = Xs.shape[1]
+                                if ridge_penalty > 0:
+                                    XtX = X_design.T @ X_design
+                                    penalty = np.zeros_like(XtX)
+                                    penalty[-n_pen:, -n_pen:] = ridge_penalty * np.eye(n_pen)
+                                    beta = np.linalg.solve(XtX + penalty, X_design.T @ y_vals)
+                                else:
+                                    beta = np.linalg.lstsq(X_design, y_vals, rcond=None)[0]
+                                    penalty = np.zeros((X_design.shape[1], X_design.shape[1]))
+                                y_hat = X_design @ beta
+                                beta_lag_scaled = beta[-n_pen:]
+                                beta_lag = beta_lag_scaled / x_std
+                                return beta_lag, y_hat, X_design, penalty, x_std
+
+                            dow_series = pd.Series(date_index).dt.dayofweek if include_dow else None
+                            beta_lag, y_hat, X_design, penalty, x_std = _fit_ridge_response(
+                                x_series.values.astype(float),
+                                y_series.values,
+                                max_lag,
+                                ridge_lambda,
+                                dow_series,
+                                include_trend
+                            )
+
+                            ss_tot = float(((y_series - y_series.mean()) ** 2).sum())
+                            ss_res = float(((y_series - y_hat) ** 2).sum())
+                            r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else np.nan
+
+                            def _bootstrap_ci():
+                                if n_boot <= 0:
+                                    return None, None
+                                rng = np.random.default_rng(7)
+                                resids = y_series.values - y_hat
+                                betas = []
+                                XtX = X_design.T @ X_design
+                                for _ in range(n_boot):
+                                    resampled = rng.choice(resids, size=len(resids), replace=True)
+                                    yb = y_hat + resampled
+                                    if ridge_lambda > 0:
+                                        beta_b = np.linalg.solve(XtX + penalty, X_design.T @ yb)
+                                    else:
+                                        beta_b = np.linalg.lstsq(X_design, yb, rcond=None)[0]
+                                    beta_lag_scaled = beta_b[-len(x_std):]
+                                    betas.append(beta_lag_scaled / x_std)
+                                beta_arr = np.vstack(betas)
+                                lower = np.nanpercentile(beta_arr, 10, axis=0)
+                                upper = np.nanpercentile(beta_arr, 90, axis=0)
+                                return lower, upper
+
+                            ci_lower, ci_upper = _bootstrap_ci() if show_boot else (None, None)
+
+                            response = beta_lag
+                            response_pos = np.clip(response, 0, None)
+                            total_response = response_pos.sum()
+                            if total_response <= 0:
+                                st.caption("Model did not find a positive lagged response in this window.")
                             else:
-                                peak_date = post_budget.idxmax()
-                                days_to_peak = (peak_date - budget_hit_date).days
-                                st.caption(
-                                    f"So what: after the budget is fully deployed, "
-                                    f"referrals peak about {days_to_peak} days later "
-                                    f"(budget on {budget_hit_date.date()}, peak on {peak_date.date()})."
-                                )
+                                weights = response_pos / total_response
+                                cum = np.cumsum(weights)
+                                peak_day = int(np.argmax(response_pos))
+                                p50_day = int(np.searchsorted(cum, 0.5))
+                                p80_day = int(np.searchsorted(cum, 0.8))
+                                effect_per_1k = total_response * 1000
 
-                                peak_fig = go.Figure()
-                                peak_fig.add_trace(go.Scatter(
-                                    x=spend_daily.index,
-                                    y=spend_daily["Cumulative_Spend"],
-                                    name="Cumulative Spend",
+                                kpi_left, kpi_right = st.columns([1.3, 1])
+                                with kpi_left:
+                                    st.markdown(f"""
+                                    <div class="kpi-row">
+                                        <div class="kpi"><div class="kpi-label">Peak Lag</div><div class="kpi-value">{peak_day} days</div></div>
+                                        <div class="kpi"><div class="kpi-label">P50 Impact</div><div class="kpi-value">{p50_day} days</div></div>
+                                        <div class="kpi"><div class="kpi-label">P80 Impact</div><div class="kpi-value">{p80_day} days</div></div>
+                                    </div>
+                                    """, unsafe_allow_html=True)
+                                with kpi_right:
+                                    st.markdown(f"""
+                                    <div class="kpi-row">
+                                        <div class="kpi"><div class="kpi-label">Response / $1k</div><div class="kpi-value">{effect_per_1k:.2f} refs</div></div>
+                                        <div class="kpi"><div class="kpi-label">Model R²</div><div class="kpi-value">{_fmt(r2, fmt="{:.2f}")}</div></div>
+                                    </div>
+                                    """, unsafe_allow_html=True)
+
+                            curve_df = pd.DataFrame({
+                                "Lag_days": np.arange(0, max_lag + 1),
+                                "Response": response
+                            })
+                            curve_fig = go.Figure()
+                            if ci_lower is not None and ci_upper is not None:
+                                curve_fig.add_trace(go.Scatter(
+                                    x=curve_df["Lag_days"],
+                                    y=ci_upper,
                                     mode="lines",
-                                    line=dict(color="#6366f1")
+                                    line=dict(width=0),
+                                    showlegend=False
                                 ))
-                                peak_fig.add_trace(go.Bar(
-                                    x=ref_daily.index,
-                                    y=ref_daily.values,
-                                    name="Referrals",
-                                    marker_color="#14b8a6",
-                                    yaxis="y2",
-                                    opacity=0.6
+                                curve_fig.add_trace(go.Scatter(
+                                    x=curve_df["Lag_days"],
+                                    y=ci_lower,
+                                    mode="lines",
+                                    fill="tonexty",
+                                    fillcolor="rgba(99, 102, 241, 0.2)",
+                                    line=dict(width=0),
+                                    name="90% CI"
                                 ))
-                                budget_hit_dt = pd.Timestamp(budget_hit_date).to_pydatetime()
-                                peak_dt = pd.Timestamp(peak_date).to_pydatetime()
-                                peak_fig.add_shape(
-                                    type="line",
-                                    x0=budget_hit_dt,
-                                    x1=budget_hit_dt,
-                                    y0=0,
-                                    y1=1,
-                                    xref="x",
-                                    yref="paper",
-                                    line=dict(color="#f59e0b", dash="dash")
+                            curve_fig.add_trace(go.Scatter(
+                                x=curve_df["Lag_days"],
+                                y=curve_df["Response"],
+                                mode="lines+markers",
+                                line=dict(color="#6366f1"),
+                                name="Response"
+                            ))
+                            curve_fig.add_hline(y=0, line_dash="dot", line_color="#94a3b8")
+                            curve_fig.update_layout(
+                                height=260,
+                                margin=dict(l=0, r=0, t=30, b=0),
+                                xaxis_title="Lag (days)",
+                                yaxis_title="Referrals per unit signal",
+                                title="Estimated lag response curve"
+                            )
+                            st.plotly_chart(curve_fig, use_container_width=True, config={"displayModeBar": False})
+
+                            spend_daily = media_daily["Spend"].copy()
+                            total_spend = float(spend_daily.sum())
+                            if total_spend <= 0:
+                                st.caption("No spend recorded for this selection.")
+                            else:
+                                step = max(50.0, total_spend / 200)
+                                budget = st.slider(
+                                    "Budget to evaluate",
+                                    0.0,
+                                    float(total_spend),
+                                    float(total_spend * 0.5),
+                                    step=float(step),
+                                    key="budget_response_budget"
                                 )
-                                peak_fig.add_annotation(
-                                    x=budget_hit_dt,
-                                    y=1,
-                                    xref="x",
-                                    yref="paper",
-                                    text="Budget deployed",
-                                    showarrow=False,
-                                    yanchor="bottom",
-                                    font=dict(color="#f59e0b")
-                                )
-                                peak_fig.add_shape(
-                                    type="line",
-                                    x0=peak_dt,
-                                    x1=peak_dt,
-                                    y0=0,
-                                    y1=1,
-                                    xref="x",
-                                    yref="paper",
-                                    line=dict(color="#22c55e", dash="dot")
-                                )
-                                peak_fig.add_annotation(
-                                    x=peak_dt,
-                                    y=1,
-                                    xref="x",
-                                    yref="paper",
-                                    text="Referral peak",
-                                    showarrow=False,
-                                    yanchor="bottom",
-                                    font=dict(color="#22c55e")
-                                )
-                                peak_fig.add_hline(
-                                    y=budget,
-                                    line_dash="dot",
-                                    line_color="#f59e0b",
-                                    annotation_text="Budget",
-                                    annotation_position="bottom left"
-                                )
-                                peak_fig.update_layout(
-                                    height=280,
-                                    margin=dict(l=0, r=0, t=30, b=0),
-                                    yaxis_title="Cumulative Spend",
-                                    yaxis2=dict(
-                                        overlaying="y",
-                                        side="right",
-                                        title="Referrals",
-                                        rangemode="tozero"
-                                    ),
-                                    title="Budget deployment vs referral peak"
-                                )
-                                st.plotly_chart(peak_fig, use_container_width=True, config={"displayModeBar": False})
+                                if total_response <= 0:
+                                    st.caption("Model did not find a positive response; budget impact not estimated.")
+                                elif budget <= 0:
+                                    st.caption("Select a positive budget to project impact.")
+                                else:
+                                    spend_cum = spend_daily.cumsum()
+                                    hit_idx = spend_cum[spend_cum >= budget]
+                                    if hit_idx.empty:
+                                        st.caption("Budget not fully deployed within the selected date range.")
+                                    else:
+                                        budget_hit_date = hit_idx.index[0]
+                                        expected_by_lag = budget * response_pos
+                                        impact_dates = [budget_hit_date + pd.Timedelta(days=int(l)) for l in range(len(expected_by_lag))]
+                                        impact_df = pd.DataFrame({
+                                            "Date": impact_dates,
+                                            "Expected_Referrals": expected_by_lag
+                                        })
+                                        impact_df["Cumulative"] = impact_df["Expected_Referrals"].cumsum()
+                                        total_expected = impact_df["Expected_Referrals"].sum()
+                                        if total_expected > 0:
+                                            cum_ratio = impact_df["Cumulative"] / total_expected
+                                            p50_date = impact_df.loc[cum_ratio >= 0.5, "Date"].iloc[0]
+                                            p80_date = impact_df.loc[cum_ratio >= 0.8, "Date"].iloc[0]
+                                            st.caption(
+                                                f"Expected impact window: 50% by {p50_date.date()} "
+                                                f"(~{(p50_date - budget_hit_date).days} days), "
+                                                f"80% by {p80_date.date()} (~{(p80_date - budget_hit_date).days} days)."
+                                            )
+
+                                        impact_fig = go.Figure()
+                                        impact_fig.add_trace(go.Bar(
+                                            x=impact_df["Date"],
+                                            y=impact_df["Expected_Referrals"],
+                                            name="Expected referrals",
+                                            marker_color="#14b8a6"
+                                        ))
+                                        impact_fig.add_trace(go.Scatter(
+                                            x=impact_df["Date"],
+                                            y=impact_df["Cumulative"],
+                                            name="Cumulative",
+                                            mode="lines",
+                                            yaxis="y2",
+                                            line=dict(color="#6366f1")
+                                        ))
+                                        impact_fig.add_shape(
+                                            type="line",
+                                            x0=budget_hit_date,
+                                            x1=budget_hit_date,
+                                            y0=0,
+                                            y1=1,
+                                            xref="x",
+                                            yref="paper",
+                                            line=dict(color="#f59e0b", dash="dash")
+                                        )
+                                        impact_fig.add_annotation(
+                                            x=budget_hit_date,
+                                            y=1,
+                                            xref="x",
+                                            yref="paper",
+                                            text="Budget deployed",
+                                            showarrow=False,
+                                            yanchor="bottom",
+                                            font=dict(color="#f59e0b")
+                                        )
+                                        impact_fig.update_layout(
+                                            height=280,
+                                            margin=dict(l=0, r=0, t=30, b=0),
+                                            yaxis_title="Expected referrals",
+                                            yaxis2=dict(
+                                                overlaying="y",
+                                                side="right",
+                                                title="Cumulative expected referrals",
+                                                rangemode="tozero"
+                                            ),
+                                            title="Budget deployment vs expected referral impact"
+                                        )
+                                        st.plotly_chart(impact_fig, use_container_width=True, config={"displayModeBar": False})
 
 if __name__ == "__main__":
     main()

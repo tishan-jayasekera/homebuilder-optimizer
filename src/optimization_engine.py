@@ -1,6 +1,26 @@
 """
 Referral Network Optimization Engine
 Computes lag metrics, spike detection, pacing, and optimization scores for referral networks.
+
+This module is designed to take raw event, origin performance, and media spend data and
+produce a consistent set of diagnostics that feed the referral optimization UI. It avoids
+model-heavy assumptions: most metrics are robust summaries (medians, percentiles, ratios)
+and the few inference steps (e.g., cross-correlation for media lag) are guarded with
+basic significance checks to reduce false signals.
+
+Interpretation guide (plain language):
+- Lag metrics: "How long does it usually take for activity to show results?"
+  - L_media: days between spend and leads showing up.
+  - L_conv: days between a lead and that lead becoming qualified.
+  - L_ref: days between a parent lead and a referral lead.
+  Shorter lags mean faster feedback and faster payback.
+- Pacing: "Are we ahead or behind where we should be by now?"
+  Pacing factor ~1.0 is on track. Below 0.8 is behind, above 1.2 is ahead/over capacity.
+- Optimization score: "Where should we prioritize attention or budget?"
+  Higher score means better mix of conversion, referral lift, speed, pacing stability,
+  and cost efficiency.
+- Spike detection: "Was a big day likely caused by campaigns, viral spread, or neither?"
+  This is a heuristic, not a proof.
 """
 import pandas as pd
 import numpy as np
@@ -11,6 +31,7 @@ from .attribution_engine import FullFunnelAttributor, PacingValidator, integrate
 
 
 def _find_col(columns, candidates):
+    """Return the first matching column from candidates (case-insensitive)."""
     col_map = {c.lower(): c for c in columns}
     for cand in candidates:
         if cand in columns:
@@ -21,6 +42,7 @@ def _find_col(columns, candidates):
 
 
 def _normalize_bool(series: pd.Series) -> pd.Series:
+    """Normalize mixed-type boolean flags into True/False with conservative defaults."""
     if series is None:
         return pd.Series(False, index=[])
     if series.dtype == bool:
@@ -35,6 +57,7 @@ def _normalize_bool(series: pd.Series) -> pd.Series:
 
 
 def _score_inverse(value: float, high: float) -> float:
+    """Map a lower-is-better metric onto a 0-100 score using a high-water mark."""
     if high is None or high <= 0:
         return 100.0
     if value is None or value <= 0:
@@ -44,7 +67,14 @@ def _score_inverse(value: float, high: float) -> float:
 
 @dataclass
 class LagMetrics:
-    """Container for lag estimation results."""
+    """
+    Container for lag estimation results.
+
+    Interpretation:
+    - L_media (spend -> lead): If 7, spending today tends to show leads ~7 days later.
+    - L_conv (lead -> qualified): If 14, leads typically convert in ~2 weeks.
+    - L_ref (parent -> referral): If 21, referral waves build over ~3 weeks.
+    """
     L_conv: float  # Median conversion lag (days)
     L_ref: float   # Median referral gestation lag (days)
     L_media: int   # Media-to-lead lag (days)
@@ -52,7 +82,13 @@ class LagMetrics:
 
 @dataclass
 class SpikeEvent:
-    """Container for spike detection results."""
+    """
+    Container for spike detection results.
+
+    Interpretation:
+    - attribution: best-guess cause for a spike day.
+    - confidence: 0-1, higher means stronger evidence for the attribution.
+    """
     date: pd.Timestamp
     lead_count: int
     attribution: str  # 'Campaign Driven', 'Viral Surge', 'Organic/Unknown'
@@ -61,7 +97,13 @@ class SpikeEvent:
 
 @dataclass
 class PacingMetrics:
-    """Container for pacing analysis."""
+    """
+    Container for pacing analysis.
+
+    Interpretation:
+    - current_pacing_factor: 1.0 means on pace; 0.8 means 20% behind; 1.2 means 20% ahead.
+    - status: summary label based on pacing factor.
+    """
     current_pacing_factor: float
     status: str  # 'Healthy', 'Exceeding Capacity', 'Under-pacing'
     cumulative_actual: int
@@ -70,7 +112,18 @@ class PacingMetrics:
 
 @dataclass
 class OptimizationScore:
-    """Container for optimization score components."""
+    """
+    Container for optimization score components.
+
+    Interpretation:
+    - rm (Referral Multiplier): total leads per direct lead. Higher is better.
+    - eff_cpl (Effective CPL): lower is better.
+    - conversion: share of leads that become qualified. Higher is better.
+    - lag_score: higher means faster referral cycle.
+    - pacing_score: higher means stable pacing around target.
+    - efficiency: higher means lower CPL vs peers.
+    - total_score: weighted summary to prioritize action.
+    """
     payer: str
     spend: float
     direct_leads: int
@@ -97,6 +150,16 @@ class FastOptimizationResult:
 class ReferralOptimizationEngine:
     """
     Core engine for computing referral network optimization metrics.
+
+    Design notes:
+    1. Inputs are messy: columns are auto-detected and converted into standard types.
+    2. Metrics are designed to be stable and comparable across payers/builders.
+    3. The engine can run in "lite" mode to avoid heavy attribution logic when unavailable.
+
+    Non-technical usage:
+    - Use lag metrics to set expectation windows (avoid judging too early).
+    - Use pacing to see if targets are likely to be hit on time.
+    - Use optimization scores to prioritize where budget or creative effort should go.
     """
 
     def __init__(self, events_df: pd.DataFrame, origin_perf_df: Optional[pd.DataFrame] = None, media_raw_df: Optional[pd.DataFrame] = None, lite: bool = False):
@@ -107,6 +170,7 @@ class ReferralOptimizationEngine:
             events_df: Events master data
             origin_perf_df: Origin performance data
             media_raw_df: Daily media spend data
+            lite: Skip attribution and pacing validator setup for faster execution.
         """
         self.events = events_df.copy()
         self.origin_perf = origin_perf_df.copy() if origin_perf_df is not None else pd.DataFrame()
@@ -132,25 +196,50 @@ class ReferralOptimizationEngine:
             self.pacing_validator = PacingValidator(self.events)
 
     def compute_system_level_cpr(self, payer: str) -> float:
-        """Get system-level CPR including all downstream network effects."""
+        """
+        Get system-level CPR including all downstream network effects.
+
+        This uses the full attribution engine; in lite mode it is unavailable.
+        """
         if not self._attribution_helpers:
             raise RuntimeError("Attribution engine not initialized (lite mode).")
         return self._attribution_helpers['compute_system_cpr'](payer)
 
     def get_full_attribution(self, payer: str):
-        """Get complete attribution result for a payer."""
+        """
+        Get complete attribution result for a payer (requires full attribution).
+
+        Interpretation:
+        - This explains how a payer's spend flows through referral chains.
+        - Use it to justify why a payer looks strong or weak in scores.
+        """
         if self.attributor is None:
             raise RuntimeError("Attribution engine not initialized (lite mode).")
         return self.attributor.attribute_spend(payer)
 
     def validate_builder_pacing(self, builder: str):
-        """Validate pacing feasibility for a builder."""
+        """
+        Validate pacing feasibility for a builder using job windows and targets.
+
+        In lite mode, pacing validation is unavailable.
+        """
         if self.pacing_validator is None:
             raise RuntimeError("Pacing validator not initialized (lite mode).")
         return self.pacing_validator.validate_builder(builder)
 
     def _preprocess_data(self):
-        """Clean and prepare data for analysis."""
+        """
+        Clean and prepare data for analysis.
+
+        Steps:
+        1. Map core columns (lead ids, dates, payer/builders, flags).
+        2. Coerce date fields to datetime for safe arithmetic.
+        3. Normalize boolean flags so filters behave consistently.
+
+        Interpretation:
+        - This stage does not "score" anything; it just makes the data reliable
+          so downstream metrics are comparable.
+        """
         # Map core event columns
         self.cols["lead_id"] = _find_col(self.events.columns, ["LeadId", "lead_id", "LeadID"])
         self.cols["parent_id"] = _find_col(
@@ -188,7 +277,18 @@ class ReferralOptimizationEngine:
                 self.events[col] = _normalize_bool(self.events[col])
 
     def _build_attribution(self):
-        """Attribute each lead to the original media payer in its referral chain."""
+        """
+        Attribute each lead to the original media payer in its referral chain.
+
+        Approach:
+        - Build a lead_id -> payer map (from MediaPayer or OriginBuilder).
+        - Build a lead_id -> parent_id map.
+        - Resolve recursively so each lead inherits payer from its ancestor.
+
+        Interpretation:
+        - If a lead was referred by another lead, credit flows back to the original payer.
+        - This helps measure full network impact, not just direct leads.
+        """
         payer_col = self.cols.get("media_payer")
         origin_col = self.cols.get("origin_builder")
         lead_id_col = self.cols.get("lead_id")
@@ -227,7 +327,15 @@ class ReferralOptimizationEngine:
         self.builder_targets = self._build_builder_targets()
 
     def _build_builder_targets(self) -> Dict[str, float]:
-        """Build per-builder daily lead targets using job target and live window."""
+        """
+        Build per-builder daily lead targets using job target and live window.
+
+        If job start/end dates are missing, it falls back to the min/max lead dates
+        in the dataset to avoid divide-by-zero or empty windows.
+
+        Interpretation:
+        - Targets are expressed as daily expectations so pacing can be tracked day by day.
+        """
         target_col = self.cols.get("lead_target")
         dest_col = self.cols.get("dest_builder")
         start_col = self.cols.get("job_start")
@@ -272,7 +380,18 @@ class ReferralOptimizationEngine:
         return targets
 
     def compute_pacing_series(self, target_leads_per_month: Optional[int] = None, use_builder_targets: bool = True) -> pd.DataFrame:
-        """Return daily pacing series with cumulative actual/target."""
+        """
+        Return daily pacing series with cumulative actual and cumulative target.
+
+        - If builder targets exist and `use_builder_targets=True`, each day’s target
+          is the sum of builder-specific daily targets within their live windows.
+        - Otherwise, targets are derived from historical monthly average.
+
+        Interpretation:
+        - The cumulative target is a "should-have-by-now" line.
+        - The cumulative actual is what actually happened.
+        - The gap between them is your pacing deficit or surplus.
+        """
         lead_date_col = self.cols.get("lead_date")
         if self.events.empty or not lead_date_col:
             return pd.DataFrame()
@@ -332,7 +451,19 @@ class ReferralOptimizationEngine:
         return daily
 
     def compute_builder_pacing(self) -> pd.DataFrame:
-        """Compute pacing factor per destination builder using builder targets."""
+        """
+        Compute pacing factor per destination builder using builder targets.
+
+        The pacing factor compares cumulative actual to cumulative target.
+        Status bands:
+        - > 1.2: Exceeding Capacity
+        - < 0.8: Under-pacing
+        - else: Healthy
+
+        Interpretation:
+        - Under-pacing builders are at risk of missing job targets.
+        - Exceeding capacity may signal wasted spend or lead overflow risk.
+        """
         dest_col = self.cols.get("dest_builder")
         lead_date_col = self.cols.get("lead_date")
         if not dest_col or not lead_date_col or not self.builder_targets:
@@ -374,6 +505,15 @@ class ReferralOptimizationEngine:
 
         Returns:
             LagMetrics object with computed lags
+
+        Definitions:
+        - L_conv: Median delay from lead_date to RefDate for qualified leads.
+        - L_ref: Median delay from parent lead_date to child lead_date (referral gestation).
+        - L_media: Media-to-lead lag via cross-correlation on daily series.
+
+        Interpretation:
+        - Use L_media to decide how long to wait before judging a spend change.
+        - Use L_conv/L_ref to set realistic timelines for referral lift.
         """
         lead_date_col = self.cols.get("lead_date")
         ref_date_col = self.cols.get("ref_date")
@@ -417,6 +557,14 @@ class ReferralOptimizationEngine:
 
         Returns:
             Lag in days (0 if no correlation found)
+
+        Notes:
+        - Uses a symmetric window (-30 to +30 days).
+        - Returns 0 if correlation strength is weak (< 0.3).
+
+        Interpretation:
+        - A non-zero lag means leads tend to follow spend after that many days.
+        - A zero result often means the relationship is too weak to trust.
         """
         if self.media_raw.empty or self.events.empty:
             return 0
@@ -470,7 +618,15 @@ class ReferralOptimizationEngine:
         return best_lag if abs(max_corr) > 0.3 else 0  # Only return lag if correlation is significant
 
     def compute_media_lag_by_ad_key(self, top_n: int = 10) -> pd.DataFrame:
-        """Compute media-to-lead lag per ad_key for timing recommendations."""
+        """
+        Compute media-to-lead lag per ad_key for timing recommendations.
+
+        Returns a table of top_n ad_keys with their best lag and correlation.
+
+        Interpretation:
+        - Use this to spot ads that respond quickly vs. slowly.
+        - Low correlation means the lag estimate is unreliable.
+        """
         date_col = _find_col(self.media_raw.columns, ['Date', 'date', 'SpendDate', 'spend_date'])
         spend_col = _find_col(self.media_raw.columns, ['Amount_spent', 'amount_spent', 'Spend', 'spend', 'Cost'])
         ad_col = _find_col(self.media_raw.columns, ['ad_key', 'AdKey', 'campaign_key', 'CampaignKey'])
@@ -532,6 +688,15 @@ class ReferralOptimizationEngine:
 
         Returns:
             List of SpikeEvent objects
+
+        Method:
+        - Compute daily lead counts.
+        - Flag spikes using an IQR-based threshold (Q3 + 2.5*IQR).
+        - Attribute each spike to a likely cause using media lag context.
+
+        Interpretation:
+        - Spikes can be campaign-driven, viral, or organic.
+        - This helps explain anomalies in weekly/monthly charts.
         """
         if self.events.empty:
             return []
@@ -574,6 +739,15 @@ class ReferralOptimizationEngine:
 
         Returns:
             Attribution string
+
+        Heuristics:
+        - Campaign Driven: spend spikes within +/- L_media window.
+        - Viral Surge: a single parent/payer dominates spike-day leads.
+        - Organic/Unknown: default when no strong signal is found.
+
+        Interpretation:
+        - "Campaign Driven" suggests paid media likely caused the spike.
+        - "Viral Surge" suggests referrals amplified a single source.
         """
         def _find_col(columns, candidates):
             col_map = {c.lower(): c for c in columns}
@@ -632,6 +806,11 @@ class ReferralOptimizationEngine:
 
         Returns:
             Confidence between 0-1
+
+        This is intentionally simple to keep the output interpretable.
+
+        Interpretation:
+        - Use confidence as a hint, not a guarantee.
         """
         # Simplified confidence calculation
         if attribution == 'Campaign Driven':
@@ -650,6 +829,12 @@ class ReferralOptimizationEngine:
 
         Returns:
             PacingMetrics object
+
+        Pacing factor is cumulative actual / cumulative target at the latest date.
+
+        Interpretation:
+        - If pacing is under 0.8, consider reallocating or boosting campaigns.
+        - If pacing is over 1.2, consider throttling to avoid waste.
         """
         if self.events.empty:
             return PacingMetrics(0.0, 'No Data', 0, 0)
@@ -686,6 +871,17 @@ class ReferralOptimizationEngine:
 
         Returns:
             List of OptimizationScore objects, sorted by total_score descending
+
+        Scoring components:
+        - Conversion: qualified leads rate.
+        - RM: referral multiplier (total leads / direct leads).
+        - Lag score: inverse of referral lag (shorter is better).
+        - Pacing: stability around target band.
+        - Efficiency: inverse of effective CPL.
+
+        Interpretation:
+        - Use the total score to rank payers for action.
+        - Use component scores to understand *why* a payer ranks high/low.
         """
         if self.events.empty or self.origin_perf.empty:
             return []
@@ -818,6 +1014,12 @@ class ReferralOptimizationEngine:
         return scores
 
     def _builder_windows(self) -> Dict[str, Tuple[pd.Timestamp, pd.Timestamp]]:
+        """
+        Return per-builder active windows (job start/end or lead date bounds).
+
+        Interpretation:
+        - These windows define when a builder can realistically receive leads.
+        """
         dest_col = self.cols.get("dest_builder")
         lead_date_col = self.cols.get("lead_date")
         start_col = self.cols.get("job_start")
@@ -840,6 +1042,14 @@ class ReferralOptimizationEngine:
         return windows
 
     def _build_lag_curve(self, ad_key: str, max_lag_days: int = 30) -> np.ndarray:
+        """
+        Build a smooth lag response curve centered around the median lag.
+
+        This curve is used for allocating expected delivery across future days.
+
+        Interpretation:
+        - It spreads expected leads over time rather than assuming instant impact.
+        """
         ad_col = self.cols.get("ad_key")
         lead_date_col = self.cols.get("lead_date")
         ref_date_col = self.cols.get("ref_date")
@@ -881,6 +1091,19 @@ class ReferralOptimizationEngine:
         """
         Fast heuristic allocator for spend planning with traceability.
         Produces allocation plan, expected delivery by day, and leakage.
+
+        The allocator:
+        1. Filters to active campaigns (optional).
+        2. Computes builder shortfalls vs targets.
+        3. Scores ad performance by cost-per-lead and distribution coverage.
+        4. Allocates budget under constraints (share caps, pacing bands, leakage caps).
+        5. Returns trace tables for auditability.
+
+        Interpretation:
+        - allocations: "where the budget goes."
+        - expected_delivery: "when results should show up if the plan is followed."
+        - leakage_summary: "where spend may not translate into desired delivery."
+        - trace: diagnostic tables to explain how decisions were made.
         """
         ad_col = self.cols.get("ad_key")
         dest_col = self.cols.get("dest_builder")

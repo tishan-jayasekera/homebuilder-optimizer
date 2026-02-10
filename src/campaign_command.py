@@ -7,11 +7,18 @@ from io import BytesIO
 
 def _find_col(columns, candidates):
     col_map = {c.lower(): c for c in columns}
+    col_map_stripped = {c.strip().lower(): c for c in columns}
     for cand in candidates:
         if cand in columns:
             return cand
-        if cand.lower() in col_map:
-            return col_map[cand.lower()]
+        key = cand.lower()
+        if key in col_map:
+            return col_map[key]
+        if key in col_map_stripped:
+            return col_map_stripped[key]
+        key = cand.strip().lower()
+        if key in col_map_stripped:
+            return col_map_stripped[key]
     return None
 
 
@@ -21,9 +28,38 @@ def _safe_div(a, b, default=0.0):
     return a / b
 
 
+def _normalize_status_series(series: pd.Series) -> pd.Series:
+    return (
+        series.fillna("")
+        .astype(str)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+        .str.lower()
+    )
+
+
+def _is_live_status(series: pd.Series) -> pd.Series:
+    if series is None:
+        return pd.Series(False, index=[])
+    if series.dtype == bool:
+        return series.fillna(False)
+    numeric = pd.to_numeric(series, errors="coerce")
+    if numeric.notna().any():
+        return numeric.fillna(0).astype(float) >= 1
+    s = _normalize_status_series(series)
+    negative = s.str.contains(
+        "not live|inactive|paused|cancel|cancelled|complete|completed|expired|ended|closed|stopped|archived",
+        regex=True,
+    )
+    live = s.str.contains(r"\blive\b", regex=True)
+    return live & ~negative
+
+
 @dataclass
 class CampaignStatus:
     campaign: str
+    job_id: Optional[str]
+    job_label: Optional[str]
     lead_target: float
     leads_actual: float
     leads_remaining: float
@@ -124,6 +160,10 @@ class CampaignCommandEngine:
         self.target_col = _find_col(self.events.columns, ["LeadTarget_from_job", "LeadTarget"])
         self.start_col = _find_col(self.events.columns, ["WIP_JOB_LIVE_START", "JobLiveStart"])
         self.end_col = _find_col(self.events.columns, ["WIP_JOB_LIVE_END", "JobLiveEnd"])
+        self.job_id_col = _find_col(
+            self.events.columns,
+            ["WIP_JOB_MATCHED", "WIP_Job_Matched", "WIP Job Matched", "JobMatched", "Job_Matched", "Job_ID", "JobId"],
+        )
         self.cost_col = _find_col(self.events.columns, ["MediaCost_referral_event", "MediaCost_origin_lead", "MediaCost"])
         self.is_ref_col = _find_col(self.events.columns, ["is_referral", "IsReferral"])
         self.is_origin_col = _find_col(self.events.columns, ["is_origin", "IsOrigin"])
@@ -135,7 +175,7 @@ class CampaignCommandEngine:
         )
         self.status_col = _find_col(
             self.events.columns,
-            ["STATUS_final", "Status_final", "status_final", "JobStatus", "Job_Status", "WIP_Status"],
+            ["STATUS", "Status", "STATUS_final", "Status_final", "status_final", "JobStatus", "Job_Status", "WIP_Status"],
         )
         self.excluded_sources = set(excluded_sources) if excluded_sources else set()
         self.live_only = live_only
@@ -162,30 +202,146 @@ class CampaignCommandEngine:
         else:
             self.events[self.cost_col] = pd.to_numeric(self.events[self.cost_col], errors="coerce").fillna(0.0)
 
-        # Filter to live jobs only
-        if self.live_only and self.status_col:
+        # Build job-level composite key + label (used for grouping and display)
+        self.job_key_col = "_job_key"
+        self.job_label_col = "_job_label"
+        self.job_id_internal_col = "_job_id"
+
+        def _normalize_id(series: pd.Series) -> pd.Series:
+            return (
+                series.astype(str)
+                .str.strip()
+                .replace({"": np.nan, "nan": np.nan, "NaN": np.nan, "None": np.nan})
+            )
+
+        composite_key = None
+        if self.dest_col and self.start_col and self.end_col and self.target_col:
+            start_str = pd.to_datetime(self.events[self.start_col], errors="coerce").dt.strftime("%Y-%m-%d")
+            end_str = pd.to_datetime(self.events[self.end_col], errors="coerce").dt.strftime("%Y-%m-%d")
+            target_str = (
+                self.events[self.target_col]
+                .astype(str)
+                .replace({"nan": "-", "NaN": "-", "None": "-"})
+            )
+            dest_str = (
+                self.events[self.dest_col]
+                .astype(str)
+                .str.strip()
+                .replace({"nan": "-", "NaN": "-", "None": "-"})
+            )
+            composite_key = (
+                dest_str
+                + " | " + start_str.fillna("-")
+                + " \u2192 " + end_str.fillna("-")
+                + " | T:" + target_str
+            )
+        elif self.dest_col:
+            composite_key = (
+                self.events[self.dest_col]
+                .astype(str)
+                .str.strip()
+                .replace({"nan": "-", "NaN": "-", "None": "-"})
+            )
+
+        job_id_series = None
+        if self.job_id_col and self.job_id_col in self.events.columns:
+            job_id_series = _normalize_id(self.events[self.job_id_col])
+            self.events[self.job_id_internal_col] = job_id_series
+
+        if composite_key is None:
+            composite_key = pd.Series([""] * len(self.events), index=self.events.index)
+
+        if job_id_series is not None:
+            self.events[self.job_key_col] = job_id_series.fillna(composite_key)
+            job_label = composite_key.copy()
+            job_label = job_label.where(job_id_series.isna(), job_label + " (" + job_id_series + ")")
+            self.events[self.job_label_col] = job_label
+        else:
+            self.events[self.job_key_col] = composite_key
+            self.events[self.job_label_col] = composite_key
+
+        # Filter to live jobs only (status + end date safety)
+        if self.live_only:
             pre_filter_count = len(self.events)
-            live_mask = self.events[self.status_col].astype(str).str.strip().str.lower() == "live"
-            self.events = self.events[live_mask].copy()
+            pre_jobs = self.events[self.job_key_col].nunique(dropna=False)
+
+            status_counts = None
+            live_mask_count = None
+            if self.status_col:
+                status_norm = _normalize_status_series(self.events[self.status_col])
+                status_counts = status_norm.value_counts().head(10).to_dict()
+                live_mask = _is_live_status(self.events[self.status_col])
+                live_mask_count = int(live_mask.sum())
+            else:
+                live_mask = pd.Series(True, index=self.events.index)
+
+            end_mask_count = None
+            end_filter_used = False
+            if not self.status_col and self.end_col and self.end_col in self.events.columns:
+                end_dates = pd.to_datetime(self.events[self.end_col], errors="coerce")
+                end_mask = end_dates.isna() | (end_dates >= self.as_of_date)
+                end_mask_count = int(end_mask.sum())
+                end_filter_used = True
+            else:
+                end_mask = pd.Series(True, index=self.events.index)
+
+            combined_mask = live_mask & end_mask
+            self.events = self.events[combined_mask].copy()
+
+            post_filter_count = len(self.events)
+            post_jobs = self.events[self.job_key_col].nunique(dropna=False)
             self._filter_stats = {
                 "pre_filter": pre_filter_count,
-                "post_filter": len(self.events),
-                "removed": pre_filter_count - len(self.events),
+                "post_filter": post_filter_count,
+                "removed": pre_filter_count - post_filter_count,
+                "pre_jobs": int(pre_jobs),
+                "post_jobs": int(post_jobs),
+                "removed_jobs": int(pre_jobs - post_jobs),
+                "status_col": self.status_col,
+                "end_col": self.end_col,
+                "end_filter_used": end_filter_used,
+                "status_top": status_counts,
+                "live_mask_count": live_mask_count,
+                "end_mask_count": end_mask_count,
             }
         else:
             self._filter_stats = None
 
-        # Build job-level composite key
-        self.job_key_col = "_job_key"
-        if self.dest_col and self.start_col and self.end_col and self.target_col:
-            self.events[self.job_key_col] = (
-                self.events[self.dest_col].astype(str) + " | " +
-                self.events[self.start_col].astype(str).str[:10] + " \u2192 " +
-                self.events[self.end_col].astype(str).str[:10] + " | T:" +
-                self.events[self.target_col].astype(str)
-            )
-        elif self.dest_col:
-            self.events[self.job_key_col] = self.events[self.dest_col].astype(str)
+    def _diagnose_targets(self) -> Dict:
+        """Provide lightweight diagnostics when no campaign targets are found."""
+        diag: Dict[str, object] = {
+            "events_after_filter": int(len(self.events)),
+            "dest_col": self.dest_col,
+            "target_col": self.target_col,
+            "status_col": self.status_col,
+            "end_col": self.end_col,
+            "live_only": bool(self.live_only),
+        }
+        if self.job_key_col in self.events.columns:
+            diag["distinct_jobs_after_filter"] = int(self.events[self.job_key_col].nunique(dropna=False))
+
+        if self.dest_col and self.dest_col in self.events.columns:
+            diag["rows_with_dest"] = int(self.events[self.dest_col].notna().sum())
+        if self.target_col and self.target_col in self.events.columns:
+            target_vals = pd.to_numeric(self.events[self.target_col], errors="coerce")
+            diag["rows_with_target"] = int(target_vals.notna().sum())
+            diag["targets_positive"] = int((target_vals > 0).sum())
+            diag["targets_nonpositive"] = int((target_vals <= 0).sum())
+
+        if self.status_col and self.status_col in self.events.columns:
+            status_norm = self.events[self.status_col].astype(str).str.strip().str.lower()
+            diag["status_top"] = status_norm.value_counts().head(10).to_dict()
+            diag["status_live_count"] = int(_is_live_status(self.events[self.status_col]).sum())
+
+        if self.end_col and self.end_col in self.events.columns:
+            end_dates = pd.to_datetime(self.events[self.end_col], errors="coerce")
+            diag["end_date_missing"] = int(end_dates.isna().sum())
+            diag["end_date_future_or_today"] = int((end_dates >= self.as_of_date).sum())
+
+        if self._filter_stats:
+            diag["filter_stats"] = dict(self._filter_stats)
+
+        return diag
 
     def _median_conversion_lag(self, campaign: str) -> float:
         if not self.dest_col or not self.ref_date_col or not self.lead_date_col:
@@ -234,6 +390,14 @@ class CampaignCommandEngine:
             .dropna(subset=[self.dest_col, self.target_col])
             .drop_duplicates(self.job_key_col)
         )
+        meta_cols = [self.job_key_col]
+        if self.job_label_col in self.events.columns:
+            meta_cols.append(self.job_label_col)
+        if self.job_id_internal_col in self.events.columns:
+            meta_cols.append(self.job_id_internal_col)
+        if len(meta_cols) > 1:
+            meta = self.events[meta_cols].drop_duplicates(self.job_key_col)
+            targets = targets.merge(meta, on=self.job_key_col, how="left")
         targets[self.target_col] = pd.to_numeric(targets[self.target_col], errors="coerce")
         targets = targets[targets[self.target_col] > 0]
         if targets.empty:
@@ -246,6 +410,8 @@ class CampaignCommandEngine:
 
         for _, row in targets.iterrows():
             job_key = row[self.job_key_col]
+            job_id = row.get(self.job_id_internal_col) if self.job_id_internal_col in row else None
+            job_label = row.get(self.job_label_col) if self.job_label_col in row else job_key
             target = float(row[self.target_col])
 
             job_start = pd.to_datetime(row.get(self.start_col), errors="coerce") if self.start_col else pd.NaT
@@ -294,6 +460,8 @@ class CampaignCommandEngine:
 
             rows.append(CampaignStatus(
                 campaign=job_key,
+                job_id=str(job_id) if pd.notna(job_id) else None,
+                job_label=str(job_label) if pd.notna(job_label) else None,
                 lead_target=target,
                 leads_actual=leads_actual,
                 leads_remaining=leads_remaining,
@@ -638,7 +806,9 @@ class CampaignCommandEngine:
 
         rows = []
         for _, row in status_df.iterrows():
-            campaign = row["campaign"]
+            campaign = row.get("job_label", row["campaign"])
+            if pd.isna(campaign) or campaign == "":
+                campaign = row["campaign"]
             days_remaining = int(row["days_remaining"])
             effective_window = max(days_remaining - global_lag, 0)
             job_end = row["job_end"]
@@ -681,11 +851,17 @@ class CampaignCommandEngine:
 
     def generate_plan(self) -> CampaignPlan:
         if not self.dest_col or not self.target_col:
-            return CampaignPlan(summary={"error": "Missing LeadTarget_from_job or Dest_BuilderRegionKey."})
+            return CampaignPlan(summary={
+                "error": "Missing LeadTarget_from_job or Dest_BuilderRegionKey.",
+                "diagnostics": self._diagnose_targets(),
+            })
 
         status_df = self.compute_campaign_status()
         if status_df.empty:
-            return CampaignPlan(summary={"error": "No campaign targets found."})
+            return CampaignPlan(summary={
+                "error": "No campaign targets found.",
+                "diagnostics": self._diagnose_targets(),
+            })
 
         direct_opts = self.compute_direct_options(status_df)
         network_opts = self.compute_network_options(status_df)
