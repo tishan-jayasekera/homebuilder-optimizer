@@ -27,16 +27,21 @@ from src.network_optimization import (
     build_builder_targets,
     compute_lag_metrics_simple,
 )
-from src.postcode_optimizer import (
-    analyze_lead_gen_hotspots,
-    map_lead_destinations,
-    overlay_shortfalls_on_hotspots,
-    find_supply_paths_for_builder,
-    build_campaign_plan,
-    get_campaign_economics,
-    derive_region,
-    get_builder_shortfalls,
-)
+_OPT_IMPORT_ERROR = None
+try:
+    from src import postcode_optimizer as _postcode_optimizer
+except Exception as exc:
+    _postcode_optimizer = None
+    _OPT_IMPORT_ERROR = exc
+
+analyze_lead_gen_hotspots = getattr(_postcode_optimizer, "analyze_lead_gen_hotspots", None) if _postcode_optimizer else None
+map_lead_destinations = getattr(_postcode_optimizer, "map_lead_destinations", None) if _postcode_optimizer else None
+overlay_shortfalls_on_hotspots = getattr(_postcode_optimizer, "overlay_shortfalls_on_hotspots", None) if _postcode_optimizer else None
+find_supply_paths_for_builder = getattr(_postcode_optimizer, "find_supply_paths_for_builder", None) if _postcode_optimizer else None
+build_campaign_plan = getattr(_postcode_optimizer, "build_campaign_plan", None) if _postcode_optimizer else None
+get_campaign_economics = getattr(_postcode_optimizer, "get_campaign_economics", None) if _postcode_optimizer else None
+derive_region = getattr(_postcode_optimizer, "derive_region", None) if _postcode_optimizer else None
+get_builder_shortfalls = getattr(_postcode_optimizer, "get_builder_shortfalls", None) if _postcode_optimizer else None
 
 
 st.set_page_config(
@@ -110,6 +115,84 @@ def _find_col(columns, candidates):
         if cand.lower() in col_map:
             return col_map[cand.lower()]
     return None
+
+
+if get_builder_shortfalls is None:
+    def get_builder_shortfalls(events_df: pd.DataFrame) -> pd.DataFrame:
+        columns = ["Builder", "Lead_Target", "Actual", "Shortfall", "Days_Remaining", "Risk"]
+        if events_df is None or events_df.empty:
+            return pd.DataFrame(columns=columns)
+
+        try:
+            targets = build_builder_targets(events_df)
+            shortfalls = calculate_shortfalls(
+                events_df,
+                targets_df=targets if targets is not None and not targets.empty else None,
+            )
+        except Exception:
+            return pd.DataFrame(columns=columns)
+
+        if shortfalls is None or shortfalls.empty:
+            return pd.DataFrame(columns=columns)
+
+        builder_col = _find_col(shortfalls.columns, ["BuilderRegionKey", "Builder"])
+        target_col = _find_col(shortfalls.columns, ["LeadTarget", "Lead_Target", "LeadTarget_from_job"])
+        actual_col = _find_col(shortfalls.columns, ["Actual_Referrals", "Actual", "Actual_Leads"])
+        shortfall_col = _find_col(shortfalls.columns, ["Projected_Shortfall", "Shortfall", "Gap"])
+        days_col = _find_col(shortfalls.columns, ["Days_Remaining", "DaysRemaining"])
+        risk_col = _find_col(shortfalls.columns, ["Risk_Score", "RiskScore"])
+        if builder_col is None:
+            return pd.DataFrame(columns=columns)
+
+        out = pd.DataFrame({"Builder": shortfalls[builder_col].astype(str)})
+        out["Lead_Target"] = pd.to_numeric(shortfalls[target_col], errors="coerce").fillna(0.0) if target_col else 0.0
+        out["Actual"] = pd.to_numeric(shortfalls[actual_col], errors="coerce").fillna(0.0) if actual_col else 0.0
+        out["Shortfall"] = pd.to_numeric(shortfalls[shortfall_col], errors="coerce").fillna(0.0) if shortfall_col else 0.0
+        out["Days_Remaining"] = pd.to_numeric(shortfalls[days_col], errors="coerce").fillna(0.0) if days_col else 0.0
+        risk_score = pd.to_numeric(shortfalls[risk_col], errors="coerce").fillna(0.0) if risk_col else pd.Series(0.0, index=out.index)
+
+        def _risk_label(idx: int) -> str:
+            sf = float(out.loc[idx, "Shortfall"])
+            dr = float(out.loc[idx, "Days_Remaining"])
+            rs = float(risk_score.loc[idx]) if idx in risk_score.index else 0.0
+            if sf <= 0:
+                return "on_track"
+            if dr <= 14 or rs >= 50:
+                return "critical"
+            if dr <= 30 or rs >= 20:
+                return "at_risk"
+            return "at_risk"
+
+        out["Risk"] = [_risk_label(i) for i in out.index]
+        out = out.groupby("Builder", as_index=False).agg(
+            Lead_Target=("Lead_Target", "max"),
+            Actual=("Actual", "max"),
+            Shortfall=("Shortfall", "max"),
+            Days_Remaining=("Days_Remaining", "max"),
+            Risk=("Risk", "first"),
+        )
+        return out[columns]
+
+
+_required_optimizer_functions = {
+    "analyze_lead_gen_hotspots": analyze_lead_gen_hotspots,
+    "map_lead_destinations": map_lead_destinations,
+    "overlay_shortfalls_on_hotspots": overlay_shortfalls_on_hotspots,
+    "find_supply_paths_for_builder": find_supply_paths_for_builder,
+    "build_campaign_plan": build_campaign_plan,
+    "get_campaign_economics": get_campaign_economics,
+    "derive_region": derive_region,
+    "get_builder_shortfalls": get_builder_shortfalls,
+}
+_missing_optimizer_functions = [name for name, fn in _required_optimizer_functions.items() if fn is None]
+if _missing_optimizer_functions:
+    st.error(
+        "Unable to load postcode optimizer functions: "
+        + ", ".join(_missing_optimizer_functions)
+    )
+    if _OPT_IMPORT_ERROR is not None:
+        st.code(f"{type(_OPT_IMPORT_ERROR).__name__}: {_OPT_IMPORT_ERROR}")
+    st.stop()
 
 
 def _list_to_text(value) -> str:

@@ -31,6 +31,7 @@ from .postcode_optimizer import (
     build_campaign_plan,
     get_campaign_economics,
     derive_region,
+    get_builder_shortfalls,
 )
 
 __all__ = [
@@ -59,4 +60,5 @@ __all__ = [
     'build_campaign_plan',
     'get_campaign_economics',
     'derive_region',
+    'get_builder_shortfalls',
 ]
