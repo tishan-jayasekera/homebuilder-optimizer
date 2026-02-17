@@ -29,21 +29,25 @@ def get_available_pages():
     if not pages_dir.exists():
         return pages
     
-    for f in pages_dir.iterdir():
+    for f in sorted(pages_dir.iterdir(), key=lambda p: p.name):
         if f.suffix == '.py' and not f.name.startswith('_'):
             name_lower = f.name.lower()
             if 'builder' in name_lower or 'pnl' in name_lower:
                 pages['pnl'] = f"pages/{f.name}"
             elif 'orphan' in name_lower:
                 pages['orphan'] = f"pages/{f.name}"
-            elif 'referral' in name_lower or 'network' in name_lower:
+            elif 'postcode' in name_lower and 'optimizer' in name_lower:
+                pages['postcode_optimizer'] = f"pages/{f.name}"
+            elif 'referral' in name_lower and 'optimization' in name_lower:
+                pages['optimization'] = f"pages/{f.name}"
+            elif ('referral' in name_lower and 'network' in name_lower) or 'referral_network' in name_lower:
                 pages['network'] = f"pages/{f.name}"
             elif 'postcode' in name_lower or 'suburb' in name_lower:
                 pages['postcode'] = f"pages/{f.name}"
-            elif 'optimization' in name_lower:
-                pages['optimization'] = f"pages/{f.name}"
             elif 'optimizer' in name_lower:
                 pages['optimizer'] = f"pages/{f.name}"
+            elif 'optimization' in name_lower:
+                pages['optimization'] = f"pages/{f.name}"
     
     return pages
 
@@ -194,6 +198,20 @@ def main():
                 st.switch_page(pages['postcode'])
         else:
             st.error("Page not found: pages/4_Postcode_Insights.py")
+
+    with col5:
+        st.markdown("#### 📌 Postcode Optimizer")
+        st.markdown("""
+        Plan geographic referral growth:
+        - Net generator vs consumer postcodes
+        - Postcode shortfall coverage planning
+        - Budget allocation by postcode flows
+        """)
+        if 'postcode_optimizer' in pages:
+            if st.button("📌 Open Postcode Optimizer", key="btn_postcode_optimizer"):
+                st.switch_page(pages['postcode_optimizer'])
+        else:
+            st.error("Page not found: pages/7_Postcode_Optimizer.py")
     
     # Debug info
     pages_dir = Path(__file__).parent / "pages"

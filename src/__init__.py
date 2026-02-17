@@ -23,6 +23,13 @@ from .mathematical_optimizer import (
     TimingAlert,
     quick_optimize
 )
+from .postcode_optimizer import (
+    extract_postcode_mapping,
+    build_postcode_referral_flows,
+    cluster_postcodes,
+    calculate_postcode_shortfalls,
+    build_postcode_optimization_plan,
+)
 
 __all__ = [
     'load_events', 'load_origin_perf', 'load_media_raw',
@@ -42,5 +49,10 @@ __all__ = [
     'OptimizationResult',
     'SpendAllocation',
     'TimingAlert',
-    'quick_optimize'
+    'quick_optimize',
+    'extract_postcode_mapping',
+    'build_postcode_referral_flows',
+    'cluster_postcodes',
+    'calculate_postcode_shortfalls',
+    'build_postcode_optimization_plan',
 ]
