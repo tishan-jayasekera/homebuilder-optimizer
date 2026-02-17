@@ -24,11 +24,13 @@ from .mathematical_optimizer import (
     quick_optimize
 )
 from .postcode_optimizer import (
-    extract_postcode_mapping,
-    build_postcode_referral_flows,
-    cluster_postcodes,
-    calculate_postcode_shortfalls,
-    build_postcode_optimization_plan,
+    analyze_lead_gen_hotspots,
+    map_lead_destinations,
+    overlay_shortfalls_on_hotspots,
+    find_supply_paths_for_builder,
+    build_campaign_plan,
+    get_campaign_economics,
+    derive_region,
 )
 
 __all__ = [
@@ -50,9 +52,11 @@ __all__ = [
     'SpendAllocation',
     'TimingAlert',
     'quick_optimize',
-    'extract_postcode_mapping',
-    'build_postcode_referral_flows',
-    'cluster_postcodes',
-    'calculate_postcode_shortfalls',
-    'build_postcode_optimization_plan',
+    'analyze_lead_gen_hotspots',
+    'map_lead_destinations',
+    'overlay_shortfalls_on_hotspots',
+    'find_supply_paths_for_builder',
+    'build_campaign_plan',
+    'get_campaign_economics',
+    'derive_region',
 ]
